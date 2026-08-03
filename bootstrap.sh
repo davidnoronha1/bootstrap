@@ -2,10 +2,16 @@
 # =============================================================================
 #  bootstrap.sh - distro-agnostic dev-machine setup with an interactive TUI
 #
-#  Install & run:
+#  Install & run (config files live in ./files/ next to this script):
+#      git clone https://github.com/davidnoronha1/bootstrap && cd bootstrap
 #      bash bootstrap.sh                 # interactive, asked per step
 #      bash bootstrap.sh -y              # run everything, no prompts
-#      curl -fsSL <url>/bootstrap.sh | bash     # download & run
+#      bash bootstrap.sh -y --files-dir /path/to/files   # custom config dir
+#
+#  The dotfile/tool configs are kept as plain files in ./files/ instead of
+#  being embedded here. Point elsewhere with --files-dir or BOOTSTRAP_FILES_DIR.
+#  When run via `curl ... | bash` there's no local files dir, so the config
+#  steps are skipped.
 #
 #  Works on Ubuntu 20.04+ and most other distros. Uses only latest/unpinned
 #  sources (setup_lts.x, dotnet-install.sh LTS, nvm latest, ...) so it never
@@ -52,6 +58,8 @@ SPINNER_PID=""
 ID="" ID_LIKE="" VERSION_ID="" CODENAME="" PRETTY_NAME=""
 ARCH="$(uname -m)"
 PM="none"
+SCRIPT_DIR=""
+FILES_DIR=""
 
 # ----------------------------------------------------------------------------
 #  TUI helpers
@@ -302,7 +310,7 @@ read_line() {
     REPLY=""
     [[ $ASSUME_YES -eq 1 ]] && return 0
     if tty_open; then
-        printf '%s' "$prompt"
+        printf '%s' "$prompt" >&2
         tty_read REPLY
         tty_close
     fi
@@ -499,10 +507,48 @@ is_ver_ge() { # is_ver_ge A B  -> true if A >= B
     [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]]
 }
 
+# Reads a config file from the local files/ directory (see --files-dir /
+# BOOTSTRAP_FILES_DIR). Content functions output these to stdout, so a missing
+# file surfaces as an error instead of an empty install.
+read_file() { # read_file RELPATH -> stdout
+    local rel="$1"
+    if [[ ! -f "$FILES_DIR/$rel" ]]; then
+        err "missing config file: $FILES_DIR/$rel"
+        err "config files live next to bootstrap.sh; run from the repo checkout or set --files-dir/BOOTSTRAP_FILES_DIR"
+        return 1
+    fi
+    cat "$FILES_DIR/$rel"
+}
+
+# Replaces __VAR__ placeholders in a template with the current values of the
+# named variables (via indirect expansion), e.g.:
+#   GIT_NAME="Jane" subst_template "$FILES_DIR/gitconfig" GIT_NAME GIT_EMAIL
+# Values are used literally; `&` in a value is escaped so it isn't treated as
+# a pattern-replacement anchor.
+subst_template() { # subst_template TEMPLATE VAR...
+    local tmpl="$1" v line repl
+    shift
+    if [[ ! -f "$tmpl" ]]; then
+        err "missing template: $tmpl"
+        return 1
+    fi
+    while IFS= read -r line; do
+        for v in "$@"; do
+            repl="${!v//&/\\&}"
+            line="${line//__${v}__/$repl}"
+        done
+        printf '%s\n' "$line"
+    done < "$tmpl"
+}
+
 _write_file() { # _write_file DEST FUNC
     local dest="$1" srcfn="$2" tmp
     tmp="$(new_tmp)"
-    "$srcfn" > "$tmp"
+    if ! "$srcfn" > "$tmp"; then
+        err "failed to generate content for $dest"
+        rm -f "$tmp"
+        return 1
+    fi
     if [[ -e "$dest" ]]; then
         local bak; bak="$(new_tmp)"
         if cp "$dest" "$bak" 2>/dev/null || asroot cp "$dest" "$bak" 2>/dev/null; then
@@ -963,6 +1009,10 @@ _install_zoxide() {
 write_zshrc() {
     local home="$1" tmp
     tmp="$(new_tmp)"
+    if ! read_file "zshrc" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
     if [[ -f "$home/.zshrc" ]]; then
         asroot cp "$home/.zshrc" "$home/.zshrc.bak" 2>/dev/null || true
         BACKED_UP_FILES+=("$home/.zshrc:$home/.zshrc.bak")
@@ -970,56 +1020,6 @@ write_zshrc() {
     else
         CREATED_FILES+=("$home/.zshrc")
     fi
-    cat > "$tmp" <<'EOF'
-# ~/.zshrc - managed by bootstrap.sh (previous copy saved as ~/.zshrc.bak)
-if command -v nvim >/dev/null 2>&1; then
-    export EDITOR=nvim
-    export VISUAL=nvim
-else
-    export EDITOR=vim
-    export VISUAL=vim
-fi
-
-# PATH
-export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin:$PATH"
-
-# bun (matches the tool-managed install location)
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-
-# uv env (created by the uv installer when present)
-[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
-
-# history
-HISTFILE="$HOME/.zsh_history"
-HISTSIZE=10000
-SAVEHIST=10000
-setopt HIST_IGNORE_DUPS SHARE_HISTORY AUTO_CD
-
-# aliases
-alias ls='ls --color=auto'
-alias ll='ls -alF'
-alias la='ls -A'
-alias l='ls -CF'
-alias g='git'
-alias ga='git add'
-alias gc='git commit -m'
-alias gs='git status'
-alias gp='git push'
-alias gl='git log --oneline --graph --decorate --all -20'
-alias dc='docker compose'
-alias dcu='docker compose up -d'
-alias dcd='docker compose down'
-command -v nvim >/dev/null 2>&1 && alias vim='nvim'
-
-# nvm (loaded only when installed)
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
-
-# zoxide (z) - loaded only when installed
-command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
-EOF
     asroot install -o "$1" -g "$(id -gn "$1" 2>/dev/null || echo "$1")" -m 0644 "$tmp" "$home/.zshrc"
     rm -f "$tmp"
     ok "wrote $home/.zshrc"
@@ -1285,213 +1285,46 @@ step_toolchains() {
 #  Step: configs  (content mirrors the author's laptop, minus machine-specifics)
 # ----------------------------------------------------------------------------
 _gitconfig_content() {
-    local name email ghbin
+    local name email ghbin GIT_NAME GIT_EMAIL GH_BIN
     read_line "git user.name [${USER}]: "; name="${REPLY:-${USER}}"
     read_line "git user.email [${USER}@$(hostname)]: "; email="${REPLY:-${USER}@$(hostname)}"
     ghbin="$(command -v gh 2>/dev/null || echo /usr/bin/gh)"
-    cat <<EOF
-[credential "https://github.com"]
-	helper =
-	helper = !$ghbin auth git-credential
-[credential "https://gist.github.com"]
-	helper =
-	helper = !$ghbin auth git-credential
-[user]
-	email = $email
-	name = $name
-	signingkey = $TARGET_HOME/.ssh/id_ed25519.pub
-[gpg]
-	format = ssh
-[commit]
-	gpgsign = true
-[gpg "ssh"]
-	allowedSignersFile = $TARGET_HOME/.ssh/allowed_signers
-[credential]
-	helper = cache --timeout 7200
-[safe]
-	directory = /tmp
-EOF
+    GIT_NAME="$name"; GIT_EMAIL="$email"; GH_BIN="$ghbin"
+    subst_template "$FILES_DIR/gitconfig" GIT_NAME GIT_EMAIL GH_BIN TARGET_HOME
 }
 
 _ghostty_config_content() {
-    cat <<'EOF'
-# ~/.config/ghostty/config
-scrollbar = system
-gtk-titlebar-style = tabs
-shell-integration-features = ssh-terminfo,ssh-env
-theme = GitHub Dark Default
-EOF
+    read_file "ghostty/config"
 }
 
 _claude_settings_content() {
-    cat <<'EOF'
-{
-  "tui": "fullscreen",
-  "theme": "dark",
-  "model": "sonnet",
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.claude/statusline-command.sh"
-  }
-}
-EOF
+    read_file "claude/settings.json"
 }
 
 _statusline_script_content() {
-    cat << 'STATUSLINE_EOF'
-#!/usr/bin/env bash
-input=$(cat)
-model_id=$(jq -r '.model.id // ""' <<<"$input")
-model_name=$(jq -r '.model.display_name // "Claude"' <<<"$input")
-effort=$(jq -r '.effort.level // empty' <<<"$input")
-session_cost=$(jq -r '.cost.total_cost_usd // 0' <<<"$input")
-five_h_pct=$(jq -r '.rate_limits.five_hour.used_percentage // empty' <<<"$input")
-week_pct=$(jq -r '.rate_limits.seven_day.used_percentage // empty' <<<"$input")
-five_h_resets=$(jq -r '.rate_limits.five_hour.resets_at // empty' <<<"$input")
-week_resets=$(jq -r '.rate_limits.seven_day.resets_at // empty' <<<"$input")
-USD_TO_INR=88.50
-RESET=$'\033[0m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-RED=$'\033[31m'
-WHITE=$'\033[37m'
-GRAY=$'\033[90m'
-PLUM=$'\033[38;5;97m'
-SLATE=$'\033[38;5;67m'
-SAGE=$'\033[38;5;108m'
-DUSKBLUE=$'\033[38;5;60m'
-OLIVE=$'\033[38;5;136m'
-MINT=$'\033[38;5;108m'
-STEEL=$'\033[38;5;66m'
-AMBER=$'\033[38;5;178m'
-TERRACOTTA=$'\033[38;5;173m'
-BRICK=$'\033[38;5;131m'
-case "$model_id" in
-  claude-fable-5*)  emoji="📖"; model_color="$DUSKBLUE" ;;
-  claude-mythos-5*) emoji="🏛️"; model_color="$OLIVE" ;;
-  claude-opus*)     emoji="👑"; model_color="$PLUM" ;;
-  claude-sonnet*)   emoji="🎵"; model_color="$SLATE" ;;
-  claude-haiku*)    emoji="🍃"; model_color="$SAGE" ;;
-  *)                emoji="✨"; model_color="$WHITE" ;;
-esac
-case "$effort" in
-  low)    effort_color="$MINT" ;;
-  medium) effort_color="$STEEL" ;;
-  high)   effort_color="$AMBER" ;;
-  xhigh)  effort_color="$TERRACOTTA" ;;
-  max)    effort_color="$BRICK" ;;
-  *)      effort_color="$DIM" ;;
-esac
-read -r day_cost week_cost < <(python3 "$HOME/.claude/cost_aggregate.py" 2>/dev/null)
-day_cost=${day_cost:-0}
-week_cost=${week_cost:-0}
-bar() {
-  local pct="$1" segs=10
-  local filled=$(( (${pct%.*} * segs + 50) / 100 ))
-  (( filled < 0 )) && filled=0
-  (( filled > segs )) && filled=$segs
-  local color="$GREEN"
-  (( ${pct%.*} >= 50 )) && color="$YELLOW"
-  (( ${pct%.*} >= 80 )) && color="$RED"
-  local out="${color}"
-  for ((i=0; i<filled; i++)); do out+="█"; done
-  out+="${GRAY}"
-  for ((i=filled; i<segs; i++)); do out+="░"; done
-  out+="${RESET}"
-  printf '%s' "$out"
-}
-fmt_inr() {
-  awk -v usd="$1" -v rate="$USD_TO_INR" 'BEGIN { printf "₹%.2f", usd * rate }'
-}
-parts=()
-parts+=("${BOLD}${model_color}${emoji} ${model_name}${RESET}")
-[ -n "$effort" ] && parts+=("${effort_color}[${effort}]${RESET}")
-if [ -n "$five_h_pct" ]; then
-  five_h_line="${DIM}5h${RESET} $(bar "$five_h_pct") ${DIM}${five_h_pct%.*}%${RESET}"
-  if [ -n "$five_h_resets" ]; then
-    five_h_time=$(date -d "@${five_h_resets}" '+%-I:%M %p' 2>/dev/null)
-    [ -n "$five_h_time" ] && five_h_line+=" ${DIM}(${five_h_time})${RESET}"
-  fi
-  parts+=("$five_h_line")
-fi
-if [ -n "$week_pct" ]; then
-  week_line="${DIM}7d${RESET} $(bar "$week_pct") ${DIM}${week_pct%.*}%${RESET}"
-  if [ -n "$week_resets" ]; then
-    week_date=$(date -d "@${week_resets}" '+%-d %b' 2>/dev/null)
-    [ -n "$week_date" ] && week_line+=" ${DIM}(${week_date})${RESET}"
-  fi
-  parts+=("$week_line")
-fi
-parts+=("${GREEN}$(fmt_inr "$session_cost")${RESET}${DIM} session${RESET}")
-parts+=("${GREEN}$(fmt_inr "$day_cost")${RESET}${DIM} today${RESET}")
-parts+=("${GREEN}$(fmt_inr "$week_cost")${RESET}${DIM} week${RESET}")
-output=""
-for p in "${parts[@]}"; do
-  if [ -z "$output" ]; then
-    output="$p"
-  else
-    output="${output}  ${p}"
-  fi
-done
-printf '%s\n' "$output"
-STATUSLINE_EOF
+    read_file "claude/statusline-command.sh"
 }
 
 _cost_aggregate_script_content() {
-    cat << 'COST_AGGREGATE_EOF'
-#!/usr/bin/env python3
-import json
-import os
-from datetime import datetime, timedelta
-import fcntl
-
-cache_file = os.path.expanduser("~/.claude/cost_cache.json")
-cache_ttl = 3600
-
-def get_cached_cost():
-    if not os.path.exists(cache_file):
-        return None
-    mtime = os.path.getmtime(cache_file)
-    age = datetime.now().timestamp() - mtime
-    if age > cache_ttl:
-        return None
-    try:
-        with open(cache_file) as f:
-            data = json.load(f)
-        return data.get("day", 0), data.get("week", 0)
-    except:
-        return None
-
-def set_cached_cost(day, week):
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    try:
-        with open(cache_file, 'w') as f:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            json.dump({"day": day, "week": week, "ts": datetime.now().timestamp()}, f)
-    except:
-        pass
-
-cached = get_cached_cost()
-if cached:
-    print(cached[0], cached[1])
-else:
-    print("0 0")
-    set_cached_cost(0, 0)
-COST_AGGREGATE_EOF
+    read_file "claude/cost_aggregate.py"
 }
 
 _install_statusline_script() { # _install_statusline_script HOME
     local home="$1" tmp
     tmp="$(new_tmp)"
 
-    _statusline_script_content > "$tmp"
+    if ! read_file "claude/statusline-command.sh" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
     asroot install -D -m 0755 "$tmp" "$home/.claude/statusline-command.sh"
     asroot chown "$TARGET_USER:" "$home/.claude/statusline-command.sh" 2>/dev/null || true
 
     tmp="$(new_tmp)"
-    _cost_aggregate_script_content > "$tmp"
+    if ! read_file "claude/cost_aggregate.py" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
     asroot install -D -m 0755 "$tmp" "$home/.claude/cost_aggregate.py"
     asroot chown "$TARGET_USER:" "$home/.claude/cost_aggregate.py" 2>/dev/null || true
 
@@ -1503,7 +1336,10 @@ _merge_claude_settings() { # _merge_claude_settings HOME
     local defaults tmp
     tmp="$(new_tmp)"
 
-    _claude_settings_content > "$tmp"
+    if ! read_file "claude/settings.json" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
 
     if [[ -f "$existing" ]]; then
         if command -v jq >/dev/null 2>&1; then
@@ -1519,19 +1355,11 @@ _merge_claude_settings() { # _merge_claude_settings HOME
 }
 
 _opencode_config_content() {
-    cat <<'EOF'
-{
-  "$schema": "https://opencode.ai/config.json"
-}
-EOF
+    read_file "opencode/opencode.jsonc"
 }
 
 _tmux_content() {
-    cat <<'EOF'
-set -g mouse on
-set -g focus-events on
-set -g set-clipboard on
-EOF
+    read_file "tmux.conf"
 }
 
 run_git_config() { # run_git_config KEY VALUE   (as the target user)
@@ -1765,6 +1593,7 @@ Usage:
 Setup options:
   -y, --yes              run everything without prompting
   --user NAME            target user for dotfiles/configs
+  --files-dir DIR        dir with config files (default: ./files next to script, or \$BOOTSTRAP_FILES_DIR)
   --skip-user            skip user creation step
   --skip-network         skip network status / static IP step
   --skip-docker          skip docker step
@@ -1800,6 +1629,7 @@ parse_args() {
         case "$1" in
             -y|--yes) ASSUME_YES=1 ;;
             --user) USER_FLAG="${2:-}"; shift ;;
+            --files-dir) FILES_DIR="${2:-}"; shift ;;
             manage) shift; MANAGE_MODE="${1:-tui}"; MANAGE_ARG="${2:-}"; return 0 ;;
             --skip-user) SKIP_USER=1 ;;
             --skip-network) SKIP_NETWORK=1 ;;
@@ -1845,6 +1675,16 @@ main() {
     trap cleanup_tmp EXIT
     trap 'on_signal INT' INT
     trap 'on_signal TERM' TERM
+
+    # Locate the config files directory: --files-dir > BOOTSTRAP_FILES_DIR >
+    # ./files next to this script.
+    if [[ -z "$FILES_DIR" ]]; then
+        SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+        FILES_DIR="${BOOTSTRAP_FILES_DIR:-$SCRIPT_DIR/files}"
+    fi
+    if [[ ! -d "$FILES_DIR" ]]; then
+        warn "config files directory not found: $FILES_DIR (dotfile/config steps will be skipped)"
+    fi
 
     # Handle manage mode early
     if [[ -n "$MANAGE_MODE" ]]; then

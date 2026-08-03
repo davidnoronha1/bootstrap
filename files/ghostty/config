@@ -1,0 +1,5 @@
+# ~/.config/ghostty/config
+scrollbar = system
+gtk-titlebar-style = tabs
+shell-integration-features = ssh-terminfo,ssh-env
+theme = GitHub Dark Default

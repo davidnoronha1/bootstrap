@@ -1,0 +1,20 @@
+[credential "https://github.com"]
+	helper =
+	helper = !__GH_BIN__ auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !__GH_BIN__ auth git-credential
+[user]
+	email = __GIT_EMAIL__
+	name = __GIT_NAME__
+	signingkey = __TARGET_HOME__/.ssh/id_ed25519.pub
+[gpg]
+	format = ssh
+[commit]
+	gpgsign = true
+[gpg "ssh"]
+	allowedSignersFile = __TARGET_HOME__/.ssh/allowed_signers
+[credential]
+	helper = cache --timeout 7200
+[safe]
+	directory = /tmp

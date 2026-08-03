@@ -1,0 +1,48 @@
+# ~/.zshrc - managed by bootstrap.sh (previous copy saved as ~/.zshrc.bak)
+if command -v nvim >/dev/null 2>&1; then
+    export EDITOR=nvim
+    export VISUAL=nvim
+else
+    export EDITOR=vim
+    export VISUAL=vim
+fi
+
+# PATH
+export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin:$PATH"
+
+# bun (matches the tool-managed install location)
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+# uv env (created by the uv installer when present)
+[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
+
+# history
+HISTFILE="$HOME/.zsh_history"
+HISTSIZE=10000
+SAVEHIST=10000
+setopt HIST_IGNORE_DUPS SHARE_HISTORY AUTO_CD
+
+# aliases
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias g='git'
+alias ga='git add'
+alias gc='git commit -m'
+alias gs='git status'
+alias gp='git push'
+alias gl='git log --oneline --graph --decorate --all -20'
+alias dc='docker compose'
+alias dcu='docker compose up -d'
+alias dcd='docker compose down'
+command -v nvim >/dev/null 2>&1 && alias vim='nvim'
+
+# nvm (loaded only when installed)
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
+
+# zoxide (z) - loaded only when installed
+command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"

@@ -339,13 +339,17 @@ confirm() {
         printf '%s %s%s (yes)%s\n' "${C_GREEN}✓${C_RESET}" "$C_DIM" "$prompt" "$C_RESET"
         return 0
     fi
-    local yna q
-    [[ "$default" == [yY]* ]] && yna="Y/n" || yna="y/N"
+    local yes_opt no_opt q
+    if [[ "$default" == [yY]* ]]; then
+        yes_opt="${C_DIM}Y${C_RESET}"; no_opt="n"
+    else
+        yes_opt="y"; no_opt="${C_DIM}N${C_RESET}"
+    fi
     q="?"
     [[ "$prompt" == *\? ]] && q=""
     local ans=""
     if tty_open; then
-        printf '%s%s [%s] ' "$prompt" "$q" "$yna"
+        printf '%s%s [%s/%s] ' "$prompt" "$q" "$yes_opt" "$no_opt"
         tty_read ans
         tty_close
     fi
@@ -775,6 +779,15 @@ step_user() {
                     printf '%s:%s\n' "$nu" "$REPLY" | asroot chpasswd
                 fi
                 TARGET_USER="$nu"
+            fi
+        else
+            read_line "Target user for this setup [${DEFAULT_USER}]: "
+            if [[ -n "${REPLY:-}" ]]; then
+                if getent passwd "${REPLY}" >/dev/null 2>&1; then
+                    TARGET_USER="${REPLY}"
+                else
+                    warn "user '${REPLY}' does not exist; using ${DEFAULT_USER}"
+                fi
             fi
         fi
     fi

@@ -38,11 +38,12 @@ SKIP_GHOSTTY=0
 SKIP_TOOLS=0
 SKIP_NVIM=0
 SKIP_TOOLCHAINS=0
+SKIP_VSCODE=0
 SKIP_CONFIGS=0
 SKIP_EXTRAS=0
 USER_FLAG=""
 RESULTS=()
-STEPS_TOTAL=11
+STEPS_TOTAL=12
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 INSTALLED_LOG="$HOME/.local/var/bootstrap-managed.txt"
 
@@ -61,6 +62,9 @@ ARCH="$(uname -m)"
 PM="none"
 SCRIPT_DIR=""
 FILES_DIR=""
+DEFAULT_USER=""
+TARGET_USER=""
+TARGET_HOME=""
 
 # ----------------------------------------------------------------------------
 #  TUI helpers
@@ -835,9 +839,16 @@ step_user() {
         return 1
     fi
     ensure_user_dirs
-    asroot usermod -aG sudo,docker "$TARGET_USER" 2>/dev/null \
-        || asroot usermod -aG wheel,docker "$TARGET_USER" 2>/dev/null || true
-    ok "target user: $TARGET_USER ($TARGET_HOME) [sudo, docker]"
+    # Grant sudo/wheel and docker separately: usermod -aG is atomic across all
+    # named groups, and the 'docker' group doesn't exist until step_docker
+    # installs Docker later, which would otherwise silently block sudo too.
+    if asroot usermod -aG sudo "$TARGET_USER" 2>/dev/null || asroot usermod -aG wheel "$TARGET_USER" 2>/dev/null; then
+        ok "target user: $TARGET_USER ($TARGET_HOME) [sudo]"
+    else
+        warn "could not add $TARGET_USER to sudo/wheel group"
+    fi
+    asroot groupadd -f docker 2>/dev/null || true
+    asroot usermod -aG docker "$TARGET_USER" 2>/dev/null || true
     return 0
 }
 
@@ -1168,7 +1179,8 @@ write_zshrc() {
         return 1
     fi
     if [[ -f "$home/.zshrc" ]]; then
-        asroot cp "$home/.zshrc" "$home/.zshrc.bak" 2>/dev/null || true
+        asroot cp -p "$home/.zshrc" "$home/.zshrc.bak" 2>/dev/null || true
+        asroot chown "$1:$(id -gn "$1" 2>/dev/null || echo "$1")" "$home/.zshrc.bak" 2>/dev/null || true
         BACKED_UP_FILES+=("$home/.zshrc:$home/.zshrc.bak")
         info "existing .zshrc backed up to .zshrc.bak"
     else
@@ -1444,6 +1456,96 @@ step_toolchains() {
         if user_cmd_exists uv; then ok "uv already installed"
         elif run_user "$TARGET_USER" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'; then ok "uv installed"
         else warn "uv install failed"; fi
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+#  Step: vscode
+# ----------------------------------------------------------------------------
+_install_vscode() {
+    case "$PM" in
+        apt)
+            local keyring=/etc/apt/keyrings/packages.microsoft.gpg
+            asroot install -m 0755 -d /etc/apt/keyrings || return 1
+            curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+                | asroot gpg --dearmor --yes -o "$keyring" || return 1
+            asroot chmod a+r "$keyring" 2>/dev/null || true
+            printf 'deb [arch=amd64,arm64,armhf signed-by=%s] https://packages.microsoft.com/repos/code stable main\n' \
+                "$keyring" | asroot tee /etc/apt/sources.list.d/vscode.list >/dev/null || return 1
+            apt_get update -qq || true
+            apt_get install -y code || return 1
+            ;;
+        dnf|yum)
+            asroot rpm --import https://packages.microsoft.com/keys/microsoft.asc || return 1
+            printf '[code]\nname=Visual Studio Code\nbaseurl=https://packages.microsoft.com/yumrepos/vscode\nenabled=1\ngpgcheck=1\ngpgkey=https://packages.microsoft.com/keys/microsoft.asc\n' \
+                | asroot tee /etc/yum.repos.d/vscode.repo >/dev/null || return 1
+            _pm_install code || return 1
+            ;;
+        *)
+            if command -v snap >/dev/null 2>&1 || _pm_install snapd 2>/dev/null; then
+                asroot systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+                local i
+                for i in $(seq 1 30); do snap version >/dev/null 2>&1 && break; sleep 1; done
+                asroot snap install code --classic || return 1
+                register_managed "code" "snap"
+            else
+                warn "no packaged VS Code for '$PM'; install manually from https://code.visualstudio.com"
+                return 1
+            fi
+            ;;
+    esac
+    command -v code >/dev/null 2>&1
+}
+
+# Only add extensions for toolchains actually present, so the set matches
+# what this machine was set up with rather than installing everything.
+_install_vscode_extensions() {
+    local exts=(
+        llvm-vs-code-extensions.vscode-clangd    # clangd C/C++ (requested)
+        ms-vscode-remote.remote-containers        # Dev Containers (requested)
+        ms-azuretools.vscode-docker               # docker + compose already installed
+        eamodio.gitlens                           # git, incl. this script's ssh commit signing
+        github.vscode-pull-request-github         # gh cli already installed/authed
+        editorconfig.editorconfig
+    )
+    # cpptools is deliberately NOT included: it fights clangd over C/C++
+    # IntelliSense, and clangd was explicitly requested as the C/C++ backend.
+    command -v cmake >/dev/null 2>&1 && exts+=(ms-vscode.cmake-tools)
+    user_cmd_exists cargo  && exts+=(rust-lang.rust-analyzer)
+    user_cmd_exists node   && exts+=(esbenp.prettier-vscode dbaeumer.vscode-eslint)
+    user_cmd_exists uv     && exts+=(ms-python.python charliermarsh.ruff)
+    user_cmd_exists dotnet && exts+=(ms-dotnettools.csharp)
+
+    info "installing ${#exts[@]} extension(s) for $TARGET_USER..."
+    local e ok_n=0
+    for e in "${exts[@]}"; do
+        if run_user "$TARGET_USER" code --install-extension "$e" --force >/dev/null 2>&1; then
+            ok "extension: $e"
+            ok_n=$((ok_n + 1))
+        else
+            warn "extension install failed: $e"
+        fi
+    done
+    [[ $ok_n -gt 0 ]]
+}
+
+step_vscode() {
+    if command -v code >/dev/null 2>&1; then
+        ok "VS Code already installed: $(code --version 2>/dev/null | head -1)"
+    else
+        if ! confirm "Install Visual Studio Code?" y; then return 0; fi
+        if ! spinner "installing VS Code" _install_vscode; then
+            err "VS Code install failed"
+            return 1
+        fi
+        ok "VS Code installed: $(code --version 2>/dev/null | head -1)"
+    fi
+
+    command -v code >/dev/null 2>&1 || { warn "'code' CLI not on PATH; skipping extensions"; return 0; }
+
+    if confirm "Install VS Code extensions (clangd, Dev Containers, Docker + matching toolchains)?" y; then
+        _install_vscode_extensions || warn "some extensions failed to install; see messages above"
     fi
     return 0
 }
@@ -1804,6 +1906,7 @@ Setup options:
   --skip-tools           skip dev tools step
   --skip-nvim            skip neovim + lazyvim step
   --skip-toolchains      skip language toolchains step
+  --skip-vscode          skip VS Code + extensions step
   --skip-configs         skip dotfiles step
   --skip-extras          skip extra apps (ffmpeg, microsoft edge)
   --tui-off              plain output, no colors/spinners
@@ -1842,6 +1945,7 @@ parse_args() {
             --skip-tools) SKIP_TOOLS=1 ;;
             --skip-nvim) SKIP_NVIM=1 ;;
             --skip-toolchains) SKIP_TOOLCHAINS=1 ;;
+            --skip-vscode) SKIP_VSCODE=1 ;;
             --skip-configs) SKIP_CONFIGS=1 ;;
             --skip-extras) SKIP_EXTRAS=1 ;;
             --tui-off) TUI_OFF=1 ;;
@@ -1997,7 +2101,15 @@ main() {
     else
         DEFAULT_USER="${USER:-$(id -un)}"
     fi
-    TARGET_USER="$DEFAULT_USER"
+    TARGET_USER="${USER_FLAG:-$DEFAULT_USER}"
+    # Resolve TARGET_HOME here (not only inside step_user) so it's always set
+    # even with --skip-user; later steps (e.g. step_docker) reference it
+    # directly and would hit an unbound-variable abort under 'set -u' otherwise.
+    TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
+    if [[ -z "$TARGET_HOME" || ! -d "$TARGET_HOME" ]]; then
+        err "target user '$TARGET_USER' has no valid home directory"
+        exit 1
+    fi
 
     if ! run_step "Preflight (distro detection)" step_preflight; then
         err "preflight failed; aborting"
@@ -2012,6 +2124,7 @@ main() {
     if [[ $SKIP_TOOLS -eq 1 ]]; then skip_step "Dev tools"; else run_step "Dev tools" step_tools; fi
     if [[ $SKIP_NVIM -eq 1 ]]; then skip_step "Neovim + LazyVim"; else run_step "Neovim + LazyVim" step_neovim; fi
     if [[ $SKIP_TOOLCHAINS -eq 1 ]]; then skip_step "Language toolchains"; else run_step "Language toolchains" step_toolchains; fi
+    if [[ $SKIP_VSCODE -eq 1 ]]; then skip_step "VS Code + extensions"; else run_step "VS Code + extensions" step_vscode; fi
     if [[ $SKIP_CONFIGS -eq 1 ]]; then skip_step "Dotfiles / configs"; else run_step "Dotfiles / configs" step_configs; fi
     if [[ $SKIP_EXTRAS -eq 1 ]]; then skip_step "Extra apps (ffmpeg, edge)"; else run_step "Extra apps (ffmpeg, edge)" step_extras; fi
 

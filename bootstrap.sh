@@ -458,7 +458,10 @@ run_user() { # run_user USER cmd args...
         return 1
     fi
     local script argcmd
-    script='export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin:$PATH"; cd "$HOME" || exit 1; eval "$ARG_CMD"'
+    # Deliberately no trailing $PATH: inheriting the invoking user's PATH would
+    # make existence checks (user_cmd_exists) resolve tools that belong to the
+    # wrong user when TARGET_USER differs from the one running the script.
+    script='export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin"; cd "$HOME" || exit 1; eval "$ARG_CMD"'
     argcmd="$(printf '%q ' "$@")"
     if [[ $EUID -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
         ARG_CMD="$argcmd" runuser -u "$u" -- env HOME="$home" bash -c "$script"
@@ -473,8 +476,11 @@ run_user() { # run_user USER cmd args...
     fi
 }
 
+# Check whether a tool is available for the TARGET user specifically. Always
+# resolve as that user (never the invoking user's PATH), so a tool installed
+# only for the current user isn't mistaken for one the target user has.
 user_cmd_exists() {
-    command -v "$1" >/dev/null 2>&1 || run_user "$TARGET_USER" bash -c "command -v $1 >/dev/null 2>&1"
+    run_user "$TARGET_USER" bash -c "command -v $1 >/dev/null 2>&1"
 }
 
 # Non-interactive apt-get: without this, dpkg/debconf (or Ubuntu's needrestart)
@@ -573,6 +579,37 @@ _write_file() { # _write_file DEST FUNC
     asroot install -D -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$dest"
     rm -f "$tmp"
     ok "wrote $dest"
+}
+
+# Pre-create the standard user directories (XDG-style) owned by TARGET_USER.
+# Without these, tools that mkdir their own subdirs (nvim, ghostty, ...) hit a
+# root-owned ~/.local or ~/.config left behind by an asroot install -d and fail.
+ensure_user_dirs() {
+    TARGET_HOME="${TARGET_HOME:-$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)}"
+    [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || return 0
+    local dir g
+    g="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    for dir in \
+        "$TARGET_HOME/.local/bin" \
+        "$TARGET_HOME/.local/share" \
+        "$TARGET_HOME/.local/state" \
+        "$TARGET_HOME/.local/lib" \
+        "$TARGET_HOME/.cache" \
+        "$TARGET_HOME/.config"; do
+        asroot install -d -m 0755 -o "$TARGET_USER" -g "$g" "$dir" 2>/dev/null || true
+    done
+}
+
+# Final safety net: make the whole home dir owned by TARGET_USER. Tools that
+# were installed/symlinked as the invoking user (or root via sudo) may leave
+# files or dirs in the home owned by the wrong user, breaking later writes.
+ensure_home_ownership() {
+    [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || return 0
+    if asroot chown -R "$TARGET_USER:" "$TARGET_HOME" 2>/dev/null; then
+        ok "ensured $TARGET_HOME is owned by $TARGET_USER"
+    else
+        warn "could not chown $TARGET_HOME to $TARGET_USER; check ownership manually"
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -797,6 +834,7 @@ step_user() {
         err "target user '$TARGET_USER' has no valid home directory"
         return 1
     fi
+    ensure_user_dirs
     asroot usermod -aG sudo,docker "$TARGET_USER" 2>/dev/null \
         || asroot usermod -aG wheel,docker "$TARGET_USER" 2>/dev/null || true
     ok "target user: $TARGET_USER ($TARGET_HOME) [sudo, docker]"
@@ -958,6 +996,7 @@ _ghostty_terminfo() {
 }
 
 step_ghostty() {
+    ensure_user_dirs
     if command -v ghostty >/dev/null 2>&1; then
         ok "ghostty already installed ($(ghostty --version 2>/dev/null | head -1 || echo '?')), skipping"
         return 0
@@ -1002,7 +1041,7 @@ _symlink_local_bin() { # _symlink_local_bin SRC_BIN LINK_NAME
     local src link
     src="$(command -v "$1" 2>/dev/null)" || return 1
     link="$TARGET_HOME/.local/bin/$2"
-    asroot install -d -m 0755 "$TARGET_HOME/.local/bin"
+    asroot install -d -m 0755 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$TARGET_HOME/.local/bin"
     asroot ln -sf "$src" "$link"
     asroot chown -h "$TARGET_USER:" "$link" 2>/dev/null || true
 }
@@ -1053,6 +1092,7 @@ write_zshrc() {
 }
 
 step_tools() {
+    ensure_user_dirs
     if confirm "Install git?" y; then
         if command -v git >/dev/null 2>&1; then ok "git already installed"
         else spinner "installing git" _pm_install git || warn "git install failed"; fi
@@ -1166,7 +1206,7 @@ _install_neovim() {
         dir="$(find /opt -maxdepth 1 -type d -name 'nvim-linux*' 2>/dev/null | head -1)"
         if [[ -n "$dir" ]]; then
             asroot ln -sf "$dir/bin/nvim" /usr/local/bin/nvim 2>/dev/null || true
-            register_managed "nvim" "tarball" "/opt/$dir"
+            register_managed "nvim" "tarball" "$dir"
             command -v nvim >/dev/null 2>&1
         else
             warn "couldn't locate extracted neovim directory"
@@ -1193,17 +1233,27 @@ _install_lazyvim() {
     for p in "$TARGET_HOME/.local/share/nvim" "$TARGET_HOME/.local/state/nvim" "$TARGET_HOME/.cache/nvim"; do
         [[ -e "$p" ]] && asroot mv "$p" "$p.bak-$stamp"
     done
+    # Make sure .config is writable by the target user before cloning into it.
+    ensure_user_dirs
     if run_user "$TARGET_USER" git clone --depth 1 https://github.com/LazyVim/starter "$cfg"; then
-        run_user "$TARGET_USER" rm -rf "$cfg/.git"
-        ok "LazyVim starter installed at $cfg"
-        info "launch 'nvim' once to let LazyVim install its plugins"
+        run_user "$TARGET_USER" rm -rf "$cfg/.git" 2>/dev/null || true
+        if [[ -f "$cfg/init.lua" ]]; then
+            asroot chown -R "$TARGET_USER:" "$cfg" 2>/dev/null || true
+            ok "LazyVim starter installed at $cfg"
+            info "launch 'nvim' once to let LazyVim install its plugins"
+        else
+            warn "LazyVim clone incomplete (no init.lua in $cfg)"
+            return 1
+        fi
     else
         warn "LazyVim clone failed"
         return 1
     fi
+    return 0
 }
 
 step_neovim() {
+    ensure_user_dirs
     if confirm "Install latest Neovim?" y; then
         if command -v nvim >/dev/null 2>&1; then
             ok "neovim already installed: $(nvim --version 2>/dev/null | head -1)"
@@ -1218,7 +1268,9 @@ step_neovim() {
     fi
 
     if confirm "Install LazyVim (Neovim config distribution)?" y; then
-        _install_lazyvim
+        if ! _install_lazyvim; then
+            warn "LazyVim setup failed; see messages above"
+        fi
     fi
     return 0
 }
@@ -1313,8 +1365,8 @@ step_toolchains() {
 # ----------------------------------------------------------------------------
 _gitconfig_content() {
     local name email ghbin GIT_NAME GIT_EMAIL GH_BIN
-    read_line "git user.name [${USER}]: "; name="${REPLY:-${USER}}"
-    read_line "git user.email [${USER}@$(hostname)]: "; email="${REPLY:-${USER}@$(hostname)}"
+    read_line "git user.name [${TARGET_USER}]: "; name="${REPLY:-${TARGET_USER}}"
+    read_line "git user.email [${TARGET_USER}@$(hostname)]: "; email="${REPLY:-${TARGET_USER}@$(hostname)}"
     ghbin="$(command -v gh 2>/dev/null || echo /usr/bin/gh)"
     GIT_NAME="$name"; GIT_EMAIL="$email"; GH_BIN="$ghbin"
     subst_template "$FILES_DIR/gitconfig" GIT_NAME GIT_EMAIL GH_BIN TARGET_HOME
@@ -1397,9 +1449,9 @@ _setup_ssh_signing() {
     local ssh_dir="$TARGET_HOME/.ssh" key="$TARGET_HOME/.ssh/id_ed25519" pub="$TARGET_HOME/.ssh/id_ed25519.pub"
     local email
     email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
-    email="${email:-${USER}@$(hostname)}"
+    email="${email:-${TARGET_USER}@$(hostname)}"
 
-    asroot install -d -m 700 "$ssh_dir"
+    asroot install -d -m 700 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$ssh_dir"
 
     if [[ ! -f "$key" ]]; then
         info "generating a fresh ed25519 SSH key (new per machine)"
@@ -1430,6 +1482,7 @@ _setup_ssh_signing() {
             printf '    AddKeysToAgent yes\n'
         } | asroot tee -a "$ssh_dir/config" >/dev/null
         asroot chmod 600 "$ssh_dir/config" 2>/dev/null || true
+        asroot chown "$TARGET_USER:" "$ssh_dir/config" 2>/dev/null || true
         ok "github.com entry added to $ssh_dir/config"
     fi
 
@@ -1459,6 +1512,7 @@ _setup_ssh_signing() {
 }
 
 step_configs() {
+    ensure_user_dirs
     if ! confirm "Install dotfiles (git, ghostty, claude code, opencode, tmux)?" y; then return 0; fi
     local home="$TARGET_HOME"
 
@@ -1842,6 +1896,7 @@ main() {
     if [[ $SKIP_CONFIGS -eq 1 ]]; then skip_step "Dotfiles / configs"; else run_step "Dotfiles / configs" step_configs; fi
     if [[ $SKIP_EXTRAS -eq 1 ]]; then skip_step "Extra apps (ffmpeg, edge)"; else run_step "Extra apps (ffmpeg, edge)" step_extras; fi
 
+    ensure_home_ownership
     summary
 }
 

@@ -24,9 +24,10 @@ set -uo pipefail
 # ----------------------------------------------------------------------------
 #  Globals / defaults
 # ----------------------------------------------------------------------------
-VERSION="1.3.0"
+VERSION="1.4.0"
 ASSUME_YES=0
 TUI_OFF=0
+REMOTE_MODE=0
 MANAGE_MODE=""
 MANAGE_ARG=""
 SKIP_USER=0
@@ -448,15 +449,23 @@ run_user() { # run_user USER cmd args...
     local u="$1"; shift
     local home
     home="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"
+    if [[ -z "$home" || ! -d "$home" ]]; then
+        err "no valid home directory for user '$u'"
+        return 1
+    fi
     local script argcmd
     script='export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin:$PATH"; cd "$HOME" || exit 1; eval "$ARG_CMD"'
     argcmd="$(printf '%q ' "$@")"
     if [[ $EUID -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
         ARG_CMD="$argcmd" runuser -u "$u" -- env HOME="$home" bash -c "$script"
     elif [[ $EUID -eq 0 ]]; then
-        su -s /bin/bash "$u" -c "ARG_CMD=$(printf '%q' "$argcmd") HOME=$(printf '%q' "$home") bash -c $(printf '%q' "$script")"
-    else
+        ARG_CMD="$argcmd" su -s /bin/bash "$u" -c "$script"
+    elif [[ "$(id -u)" -eq "$(id -u "$u" 2>/dev/null)" ]]; then
         ARG_CMD="$argcmd" env HOME="$home" bash -c "$script"
+    else
+        # Not root and a different target user: switch via sudo, otherwise the
+        # command runs as the wrong user and can't even cd into the target home.
+        ARG_CMD="$argcmd" sudo -u "$u" env HOME="$home" bash -c "$script"
     fi
 }
 
@@ -754,6 +763,11 @@ step_user() {
                 if ! asroot useradd -m -s /bin/bash "$nu"; then
                     err "failed to create user '$nu'"
                     return 1
+                fi
+                local nu_home
+                nu_home="$(getent passwd "$nu" 2>/dev/null | cut -d: -f6)"
+                if [[ -n "$nu_home" && -d "$nu_home" ]]; then
+                    asroot chown -R "$nu:$nu" "$nu_home" 2>/dev/null || true
                 fi
                 CREATED_USER="$nu"
                 read_hidden "Password for $nu (leave empty for none): "
@@ -1592,6 +1606,8 @@ Usage:
 
 Setup options:
   -y, --yes              run everything without prompting
+  --remote               assume this IS the target machine (used when the
+                         script has been copied to another host over ssh)
   --user NAME            target user for dotfiles/configs
   --files-dir DIR        dir with config files (default: ./files next to script, or \$BOOTSTRAP_FILES_DIR)
   --skip-user            skip user creation step
@@ -1628,6 +1644,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -y|--yes) ASSUME_YES=1 ;;
+            --remote) REMOTE_MODE=1 ;;
             --user) USER_FLAG="${2:-}"; shift ;;
             --files-dir) FILES_DIR="${2:-}"; shift ;;
             manage) shift; MANAGE_MODE="${1:-tui}"; MANAGE_ARG="${2:-}"; return 0 ;;
@@ -1651,6 +1668,73 @@ parse_args() {
 }
 
 # ----------------------------------------------------------------------------
+#  Remote bootstrap: if this machine isn't the target, copy the script (and
+#  config files) to another host over ssh and run it there.
+# ----------------------------------------------------------------------------
+remote_bootstrap() {
+    command -v ssh >/dev/null 2>&1 || { err "ssh not found; can't reach another machine"; return 1; }
+    command -v tar >/dev/null 2>&1 || { err "tar not found; can't package the config files"; return 1; }
+
+    read_line "SSH destination for the target computer (e.g. user@host, or with a keyfile: -i ~/.ssh/key.pem user@host): "
+    local destline="${REPLY:-}"
+    destline="${destline#ssh }"
+    destline="${destline#ssh}"
+    if [[ -z "$destline" ]]; then
+        warn "no ssh destination given; aborting remote bootstrap"
+        return 1
+    fi
+
+    info "target: ssh $destline"
+    if ! confirm "Connect to '$destline' and run bootstrap there?" y; then
+        info "cancelled"
+        return 1
+    fi
+
+    local remote_dir="/tmp/bootstrap-remote-$$"
+    info "preparing $remote_dir on the target..."
+    # shellcheck disable=SC2086
+    ssh $destline "rm -rf '$remote_dir' && mkdir -p '$remote_dir'" \
+        || { err "could not reach $destline over ssh"; return 1; }
+
+    # Stream everything over ssh itself (no scp), so any ssh flags the user
+    # gives - keyfiles (-i), ports (-p), ProxyJump, -o options - apply to all
+    # transfers and the remote run alike.
+    info "copying bootstrap.sh..."
+    cat "$0" | ssh $destline "cat > '$remote_dir/bootstrap.sh'" \
+        || { err "could not copy bootstrap.sh to $destline"; return 1; }
+
+    if [[ -d "$FILES_DIR" ]]; then
+        info "copying config files..."
+        local parent base
+        parent="$(cd -- "$(dirname -- "$FILES_DIR")" 2>/dev/null && pwd -P)"
+        base="$(basename "$FILES_DIR")"
+        tar -C "$parent" -cf - "$base" | ssh $destline "tar -xf - -C '$remote_dir'" \
+            || { err "could not copy config files to $destline"; return 1; }
+    else
+        warn "no local config files dir; dotfile/config steps will be skipped on the target"
+    fi
+
+    # Forward the original flags but drop --files-dir (the copied files/ dir is
+    # used instead) and mark the remote run so it doesn't re-ask this question.
+    local FWD_ARGS=() skip=0 a
+    for a in "${ORIGINAL_ARGS[@]:-}"; do
+        if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+        if [[ "$a" == "--files-dir" ]]; then skip=1; continue; fi
+        FWD_ARGS+=("$a")
+    done
+    FWD_ARGS+=("--remote")
+    local qargs
+    qargs="$(printf '%q ' "${FWD_ARGS[@]}")"
+
+    info "starting bootstrap on the target (launched from $(hostname))..."
+    # shellcheck disable=SC2086
+    ssh $destline "cd '$remote_dir' && bash bootstrap.sh $qargs"
+    local rc=$?
+    ssh $destline "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
+    return "$rc"
+}
+
+# ----------------------------------------------------------------------------
 #  Interrupt handling
 # ----------------------------------------------------------------------------
 on_signal() {
@@ -1670,6 +1754,7 @@ on_signal() {
 #  main
 # ----------------------------------------------------------------------------
 main() {
+    ORIGINAL_ARGS=("$@")
     parse_args "$@" || exit 1
     init_colors
     trap cleanup_tmp EXIT
@@ -1684,6 +1769,13 @@ main() {
     fi
     if [[ ! -d "$FILES_DIR" ]]; then
         warn "config files directory not found: $FILES_DIR (dotfile/config steps will be skipped)"
+    fi
+
+    # Ask whether this machine is the intended target. If not, deploy the
+    # script (and config files) to another host over ssh and run it there.
+    if [[ $REMOTE_MODE -eq 0 ]] && ! confirm "Is this the target computer?" y; then
+        remote_bootstrap
+        exit $?
     fi
 
     # Handle manage mode early

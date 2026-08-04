@@ -24,7 +24,7 @@ set -uo pipefail
 # ----------------------------------------------------------------------------
 #  Globals / defaults
 # ----------------------------------------------------------------------------
-VERSION="1.4.0"
+VERSION="1.5.0"
 ASSUME_YES=0
 TUI_OFF=0
 REMOTE_MODE=0
@@ -860,49 +860,137 @@ _docker_apt_install() {
     apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
+# Set up a Docker credential store via the `pass` helper so `docker login`
+# creds aren't kept in plaintext ~/.docker/config.json. Generates a
+# passwordless GPG key for the target user if they don't have one yet.
+_docker_creds_store() {
+    local dcfg="$TARGET_HOME/.docker/config.json"
+    local gpgid="" arch ver tmpdir g
+
+    ensure_pkg gpg gnupg
+    ensure_pkg pass pass
+    ensure_pkg jq jq
+    command -v pass >/dev/null 2>&1 || { warn "pass not available; docker credentials would stay in plaintext"; return 1; }
+    g="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+
+    gpgid="$(run_user "$TARGET_USER" gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec:/{print $5; exit}')"
+    if [[ -z "$gpgid" ]]; then
+        info "generating a passwordless ed25519 GPG key for the pass store..."
+        if ! run_user "$TARGET_USER" bash -c '
+            gpg --batch --quiet --gen-key <<"EOF"
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Key-Usage: sign
+Name-Real: Bootstrap Pass
+Name-Email: bootstrap@localhost
+Expire-Date: 0
+%commit
+EOF
+        '; then
+            err "gpg key generation failed"
+            return 1
+        fi
+        gpgid="$(run_user "$TARGET_USER" gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec:/{print $5; exit}')"
+    fi
+    if [[ -z "$gpgid" ]]; then
+        err "could not determine the gpg key id"
+        return 1
+    fi
+
+    if [[ ! -d "$TARGET_HOME/.password-store" ]]; then
+        if ! run_user "$TARGET_USER" pass init "$gpgid"; then
+            err "pass init failed"
+            return 1
+        fi
+        ok "password store initialized with gpg key $gpgid"
+    fi
+
+    if ! command -v docker-credential-pass >/dev/null 2>&1; then
+        info "installing docker-credential-pass..."
+        _pm_install golang-docker-credential-helpers 2>/dev/null \
+            || _pm_install golang-github-docker-docker-credential-helpers 2>/dev/null || true
+        if ! command -v docker-credential-pass >/dev/null 2>&1; then
+            ver="$(curl -fsSL https://api.github.com/repos/docker/docker-credential-helpers/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
+            arch="amd64"; [[ "$ARCH" == arm64 ]] && arch="arm64"
+            if [[ -n "$ver" ]]; then
+                tmpdir="$(new_tmpdir)"
+                if curl -fSL --retry 2 -# -o "$tmpdir/pass.tar.gz" \
+                    "https://github.com/docker/docker-credential-helpers/releases/download/v${ver}/docker-credential-pass-v${ver}-${arch}.tar.gz"; then
+                    tar -xzf "$tmpdir/pass.tar.gz" -C "$tmpdir"
+                    asroot install -m 0755 "$tmpdir/docker-credential-pass" /usr/local/bin/docker-credential-pass
+                    register_managed "docker-credential-pass" "tarball" "/usr/local/bin/docker-credential-pass"
+                else
+                    warn "docker-credential-pass download failed"
+                fi
+            else
+                warn "could not determine docker-credential-helpers release"
+            fi
+        fi
+    fi
+    command -v docker-credential-pass >/dev/null 2>&1 || { warn "docker-credential-pass not installed; creds stay in plaintext"; return 1; }
+
+    asroot install -d -m 0755 -o "$TARGET_USER" -g "$g" "$TARGET_HOME/.docker"
+    local tmp
+    tmp="$(new_tmp)"
+    if [[ -f "$dcfg" ]]; then
+        jq '.credsStore = "pass"' "$dcfg" > "$tmp" 2>/dev/null || cp "$dcfg" "$tmp"
+    else
+        printf '{ "credsStore": "pass" }\n' > "$tmp"
+    fi
+    asroot install -o "$TARGET_USER" -g "$g" -m 0600 "$tmp" "$dcfg"
+    rm -f "$tmp"
+    ok "docker credential store set to 'pass' ($dcfg)"
+    return 0
+}
+
 step_docker() {
     if command -v docker >/dev/null 2>&1; then
         ok "docker already installed: $(docker --version 2>/dev/null | head -1)"
-        return 0
-    fi
-    if ! confirm "Install Docker + Docker Compose?" y; then return 0; fi
-
-    case "$PM" in
-        apt)
-            if ! _docker_apt_repo || ! _docker_apt_install; then
-                warn "official Docker repo failed; falling back to distro package"
-                asroot rm -f /etc/apt/sources.list.d/docker.list
-                apt_get update -qq || true
-                _pm_install docker.io docker-compose-v2 2>/dev/null || _pm_install docker.io docker-compose || true
-            fi
-            ;;
-        dnf|yum)
-            asroot "$PM" config-manager --add-repo "https://download.docker.com/linux/${ID}/docker-ce.repo" 2>/dev/null \
-                || curl -fsSL "https://download.docker.com/linux/${ID}/docker-ce.repo" | asroot tee /etc/yum.repos.d/docker-ce.repo >/dev/null
-            _pm_install docker-ce docker-ce-cli containerd.io docker-compose-plugin || _pm_install docker docker-compose || true
-            ;;
-        pacman) _pm_install docker docker-compose || true ;;
-        zypper) _pm_install docker docker-compose || true ;;
-        apk)    _pm_install docker docker-cli-compose || true ;;
-        *)
-            warn "no native docker package; using Docker's convenience script"
-            if confirm "Run get.docker.com convenience script?" y; then
-                curl -fsSL https://get.docker.com | asroot sh || return 1
-            fi
-            ;;
-    esac
-
-    command -v docker >/dev/null 2>&1 || { err "docker install failed"; return 1; }
-    asroot systemctl enable --now docker >/dev/null 2>&1 || true
-    asroot usermod -aG docker "$TARGET_USER" 2>/dev/null || true
-    ok "docker enabled and '$TARGET_USER' added to the docker group"
-
-    if docker compose version >/dev/null 2>&1; then
-        ok "docker compose v2 available"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        ok "docker-compose (v1) available"
     else
-        warn "docker compose plugin not found"
+        if ! confirm "Install Docker + Docker Compose?" y; then return 0; fi
+
+        case "$PM" in
+            apt)
+                if ! _docker_apt_repo || ! _docker_apt_install; then
+                    warn "official Docker repo failed; falling back to distro package"
+                    asroot rm -f /etc/apt/sources.list.d/docker.list
+                    apt_get update -qq || true
+                    _pm_install docker.io docker-compose-v2 2>/dev/null || _pm_install docker.io docker-compose || true
+                fi
+                ;;
+            dnf|yum)
+                asroot "$PM" config-manager --add-repo "https://download.docker.com/linux/${ID}/docker-ce.repo" 2>/dev/null \
+                    || curl -fsSL "https://download.docker.com/linux/${ID}/docker-ce.repo" | asroot tee /etc/yum.repos.d/docker-ce.repo >/dev/null
+                _pm_install docker-ce docker-ce-cli containerd.io docker-compose-plugin || _pm_install docker docker-compose || true
+                ;;
+            pacman) _pm_install docker docker-compose || true ;;
+            zypper) _pm_install docker docker-compose || true ;;
+            apk)    _pm_install docker docker-cli-compose || true ;;
+            *)
+                warn "no native docker package; using Docker's convenience script"
+                if confirm "Run get.docker.com convenience script?" y; then
+                    curl -fsSL https://get.docker.com | asroot sh || return 1
+                fi
+                ;;
+        esac
+
+        command -v docker >/dev/null 2>&1 || { err "docker install failed"; return 1; }
+        asroot systemctl enable --now docker >/dev/null 2>&1 || true
+        asroot usermod -aG docker "$TARGET_USER" 2>/dev/null || true
+        ok "docker enabled and '$TARGET_USER' added to the docker group"
+
+        if docker compose version >/dev/null 2>&1; then
+            ok "docker compose v2 available"
+        elif command -v docker-compose >/dev/null 2>&1; then
+            ok "docker-compose (v1) available"
+        else
+            warn "docker compose plugin not found"
+        fi
+    fi
+
+    if confirm "Set up a Docker credential store (docker login creds kept in pass, not plaintext)?" y; then
+        _docker_creds_store || warn "docker credential store setup incomplete; see messages above"
     fi
     return 0
 }
@@ -1511,6 +1599,35 @@ _setup_ssh_signing() {
     return 0
 }
 
+# One-time check that SSH commit signing actually works: create a scratch repo
+# as the target user, make a signed commit, and verify the signature is Good.
+_validate_git_signing() {
+    local repo sig
+    repo="$(new_tmpdir)"
+    asroot chown -R "$TARGET_USER:" "$repo" 2>/dev/null || true
+    if ! run_user "$TARGET_USER" bash -c "
+        cd '$repo' && git init -q &&
+        git config user.name 'Bootstrap Test' &&
+        git config user.email 'bootstrap-test@localhost' &&
+        git config gpg.format ssh &&
+        git config user.signingkey '$TARGET_HOME/.ssh/id_ed25519.pub' &&
+        git config gpg.ssh.allowedSignersFile '$TARGET_HOME/.ssh/allowed_signers' &&
+        git config commit.gpgsign true &&
+        echo 'signing test' > test.txt && git add test.txt &&
+        git commit -q -m 'bootstrap signing test'
+    "; then
+        err "test commit for signing verification failed"
+        return 1
+    fi
+    sig="$(run_user "$TARGET_USER" bash -c "cd '$repo' && git log -1 --format='%G? %H' 2>/dev/null")"
+    if [[ "$sig" == "G "* ]]; then
+        ok "commit signing verified (Good signature): $sig"
+        return 0
+    fi
+    err "commit signature not verified ($sig)"
+    return 1
+}
+
 step_configs() {
     ensure_user_dirs
     if ! confirm "Install dotfiles (git, ghostty, claude code, opencode, tmux)?" y; then return 0; fi
@@ -1538,7 +1655,9 @@ step_configs() {
     fi
 
     if confirm "Set up SSH key-based commit signing for git & GitHub?" y; then
-        _setup_ssh_signing
+        if _setup_ssh_signing; then
+            _validate_git_signing || warn "commit signing validation failed; see messages above"
+        fi
     fi
     return 0
 }

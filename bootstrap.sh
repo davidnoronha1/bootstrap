@@ -55,6 +55,7 @@ BACKED_UP_FILES=()
 CREATED_USER=""
 SSH_KEY_CREATED=0
 SSH_KEY_PATH=""
+WRITTEN_RC=""
 SPINNER_PID=""
 
 ID="" ID_LIKE="" VERSION_ID="" CODENAME="" PRETTY_NAME=""
@@ -1171,24 +1172,26 @@ _install_zoxide() {
     run_user "$TARGET_USER" bash -c 'curl -fSL --retry 2 -# https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash'
 }
 
-write_zshrc() {
-    local home="$1" tmp
+write_rc_file() { # write_rc_file HOME RC_FILE NAME  (e.g. write_rc_file /home/bob .zshrc zshrc)
+    local home="$1" rcfile="$2" name="$3" tmp dest
+    dest="$home/$rcfile"
     tmp="$(new_tmp)"
-    if ! read_file "zshrc" > "$tmp"; then
+    if ! read_file "$name" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
-    if [[ -f "$home/.zshrc" ]]; then
-        asroot cp -p "$home/.zshrc" "$home/.zshrc.bak" 2>/dev/null || true
-        asroot chown "$1:$(id -gn "$1" 2>/dev/null || echo "$1")" "$home/.zshrc.bak" 2>/dev/null || true
-        BACKED_UP_FILES+=("$home/.zshrc:$home/.zshrc.bak")
-        info "existing .zshrc backed up to .zshrc.bak"
+    if [[ -f "$dest" ]]; then
+        asroot cp -p "$dest" "$dest.bak" 2>/dev/null || true
+        asroot chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest.bak" 2>/dev/null || true
+        BACKED_UP_FILES+=("$dest:$dest.bak")
+        info "existing $rcfile backed up to $rcfile.bak"
     else
-        CREATED_FILES+=("$home/.zshrc")
+        CREATED_FILES+=("$dest")
     fi
-    asroot install -o "$1" -g "$(id -gn "$1" 2>/dev/null || echo "$1")" -m 0644 "$tmp" "$home/.zshrc"
+    asroot install -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$dest"
     rm -f "$tmp"
-    ok "wrote $home/.zshrc"
+    WRITTEN_RC="$rcfile"
+    ok "wrote $dest"
 }
 
 step_tools() {
@@ -1279,14 +1282,32 @@ step_tools() {
         fi
     fi
 
-    if [[ $want_zsh -eq 1 ]] && confirm "Write ~/.zshrc and set default shell to zsh?" y; then
-        write_zshrc "$TARGET_HOME"
-        if [[ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != "$(command -v zsh)" ]]; then
-            if asroot chsh -s "$(command -v zsh)" "$TARGET_USER" 2>/dev/null; then
-                ok "default shell -> zsh for $TARGET_USER (new shells only)"
-            else
-                warn "chsh failed; set shell manually with: chsh -s $(command -v zsh)"
+    # Only write the rc file for the shell actually set as the target's login
+    # shell. Switching shells is a user choice, so a declined chsh keeps bash
+    # (and its config), while an existing zsh login shell gets .zshrc.
+    local cur_shell zsh_cmd
+    cur_shell="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
+    zsh_cmd="$(command -v zsh 2>/dev/null || true)"
+
+    if [[ $want_zsh -eq 1 && -n "$zsh_cmd" ]] && confirm "Set default shell to zsh and write ~/.zshrc?" y; then
+        if write_rc_file "$TARGET_HOME" ".zshrc" "zshrc"; then
+            if [[ "$cur_shell" != "$zsh_cmd" ]]; then
+                if asroot chsh -s "$zsh_cmd" "$TARGET_USER" 2>/dev/null; then
+                    ok "default shell -> zsh for $TARGET_USER (new shells only)"
+                else
+                    warn "chsh failed; set shell manually with: chsh -s $zsh_cmd"
+                fi
             fi
+        else
+            warn "failed to write ~/.zshrc"
+        fi
+    elif [[ "$cur_shell" == */zsh ]]; then
+        if confirm "Write ~/.zshrc (adds zoxide & installed tools to PATH)?" y; then
+            write_rc_file "$TARGET_HOME" ".zshrc" "zshrc" || warn "failed to write ~/.zshrc"
+        fi
+    else
+        if confirm "Write ~/.bashrc (adds zoxide & installed tools to PATH)?" y; then
+            write_rc_file "$TARGET_HOME" ".bashrc" "bashrc" || warn "failed to write ~/.bashrc"
         fi
     fi
     return 0
@@ -1871,7 +1892,9 @@ summary() {
     done
     printf '%s\n' "${C_GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     printf '\n%sNext steps:%s\n' "${C_BOLD}" "${C_RESET}"
-    printf '     source ~/.zshrc         # reload shell config (zoxide, aliases, PATH)\n'
+    if [[ -n "$WRITTEN_RC" ]]; then
+        printf '     source ~%s   # reload shell config (zoxide, aliases, PATH)\n' "$WRITTEN_RC"
+    fi
     printf '     gh auth login           # GitHub CLI\n'
     printf '     claude                  # log in to Claude Code\n'
     printf '     opencode                # log in / configure providers\n'

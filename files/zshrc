@@ -17,6 +17,9 @@ export PATH="$BUN_INSTALL/bin:$PATH"
 # uv env (created by the uv installer when present)
 [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
 
+# cargo (rust) env
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
 # history
 HISTFILE="$HOME/.zsh_history"
 HISTSIZE=10000
@@ -28,16 +31,31 @@ alias ls='ls --color=auto'
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
+alias gdb='gdb -q '
+alias mv='mv -v'
+alias cp='cp -v'
+alias grep='grep --color=auto'
+alias diff='diff --color=auto'
+alias wget='wget --hsts-file /dev/null -c'
+alias killall='pkill'
 alias g='git'
 alias ga='git add'
 alias gc='git commit -m'
 alias gs='git status'
 alias gp='git push'
 alias gl='git log --oneline --graph --decorate --all -20'
+alias gitFixup='git commit --fixup=HEAD'
+alias gitShallowClone='git clone --depth 1'
+alias gitS='git status --short'
 alias dc='docker compose'
 alias dcu='docker compose up -d'
 alias dcd='docker compose down'
 command -v nvim >/dev/null 2>&1 && alias vim='nvim'
+if command -v bat >/dev/null 2>&1; then
+    alias cat='bat'
+elif command -v batcat >/dev/null 2>&1; then
+    alias cat='batcat'
+fi
 
 # nvm (loaded only when installed)
 export NVM_DIR="$HOME/.nvm"
@@ -46,3 +64,8 @@ export NVM_DIR="$HOME/.nvm"
 
 # zoxide (z) - loaded only when installed
 command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
+
+# fzf completion/keybindings (when installed via the git method)
+command -v fzf >/dev/null 2>&1 && {
+    [ -f "$HOME/.fzf.zsh" ] && . "$HOME/.fzf.zsh"
+}

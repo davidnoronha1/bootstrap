@@ -927,11 +927,10 @@ EOF
             arch="amd64"; [[ "$ARCH" == arm64 ]] && arch="arm64"
             if [[ -n "$ver" ]]; then
                 tmpdir="$(new_tmpdir)"
-                if curl -fSL --retry 2 -# -o "$tmpdir/pass.tar.gz" \
-                    "https://github.com/docker/docker-credential-helpers/releases/download/v${ver}/docker-credential-pass-v${ver}-${arch}.tar.gz"; then
-                    tar -xzf "$tmpdir/pass.tar.gz" -C "$tmpdir"
+                if curl -fSL --retry 2 -# -o "$tmpdir/docker-credential-pass" \
+                    "https://github.com/docker/docker-credential-helpers/releases/download/v${ver}/docker-credential-pass-v${ver}.linux-${arch}"; then
                     asroot install -m 0755 "$tmpdir/docker-credential-pass" /usr/local/bin/docker-credential-pass
-                    register_managed "docker-credential-pass" "tarball" "/usr/local/bin/docker-credential-pass"
+                    register_managed "docker-credential-pass" "binary" "/usr/local/bin/docker-credential-pass"
                 else
                     warn "docker-credential-pass download failed"
                 fi
@@ -1014,6 +1013,11 @@ step_nvidia() {
     if command -v nvidia-container-runtime >/dev/null 2>&1 \
         || { command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W nvidia-container-toolkit >/dev/null 2>&1; }; then
         ok "nvidia container toolkit already installed"
+        return 0
+    fi
+    if ! command -v nvidia-smi >/dev/null 2>&1 && [[ ! -d /proc/driver/nvidia ]] \
+        && ! (command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi nvidia); then
+        ok "no NVIDIA GPU detected; skipping container toolkit"
         return 0
     fi
     if ! confirm "Install NVIDIA Container Toolkit?" y; then return 0; fi
@@ -1361,7 +1365,11 @@ _install_lazyvim() {
         if [[ -f "$cfg/init.lua" ]]; then
             asroot chown -R "$TARGET_USER:" "$cfg" 2>/dev/null || true
             ok "LazyVim starter installed at $cfg"
-            info "launch 'nvim' once to let LazyVim install its plugins"
+            if spinner "installing LazyVim plugins" run_user "$TARGET_USER" nvim --headless "+Lazy! sync" +qa; then
+                ok "LazyVim plugins installed"
+            else
+                warn "LazyVim plugin sync failed; run 'nvim' once to finish installing plugins"
+            fi
         else
             warn "LazyVim clone incomplete (no init.lua in $cfg)"
             return 1
@@ -1526,7 +1534,6 @@ _install_vscode_extensions() {
         llvm-vs-code-extensions.vscode-clangd    # clangd C/C++ (requested)
         ms-vscode-remote.remote-containers        # Dev Containers (requested)
         ms-azuretools.vscode-docker               # docker + compose already installed
-        eamodio.gitlens                           # git, incl. this script's ssh commit signing
         github.vscode-pull-request-github         # gh cli already installed/authed
         editorconfig.editorconfig
     )
@@ -1534,7 +1541,6 @@ _install_vscode_extensions() {
     # IntelliSense, and clangd was explicitly requested as the C/C++ backend.
     command -v cmake >/dev/null 2>&1 && exts+=(ms-vscode.cmake-tools)
     user_cmd_exists cargo  && exts+=(rust-lang.rust-analyzer)
-    user_cmd_exists node   && exts+=(esbenp.prettier-vscode dbaeumer.vscode-eslint)
     user_cmd_exists uv     && exts+=(ms-python.python charliermarsh.ruff)
     user_cmd_exists dotnet && exts+=(ms-dotnettools.csharp)
 
@@ -1899,7 +1905,6 @@ summary() {
     printf '     claude                  # log in to Claude Code\n'
     printf '     opencode                # log in / configure providers\n'
     printf '     restart opencode        # new opencode config loads on restart\n'
-    printf '     nvim                    # let LazyVim finish installing plugins (if installed)\n'
     printf '     log out & back in       # pick up docker/sudo group changes\n'
     printf '\n%sDone. Happy hacking!%s\n' "${C_GREEN}" "${C_RESET}"
 }

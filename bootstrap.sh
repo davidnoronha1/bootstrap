@@ -2184,6 +2184,10 @@ step_configs() {
     _report_git_signing_status || true
     if [[ -f "$home/.gitconfig" ]]; then
         info "  ~/.gitconfig file: exists at $home/.gitconfig"
+        printf '%s\n' "  ${C_DIM}--- $home/.gitconfig ---${C_RESET}"
+        run_user "$TARGET_USER" bash -c "cat \"$home/.gitconfig\" 2>/dev/null | sed 's/^/    /'" 2>/dev/null \
+            || cat "$home/.gitconfig" 2>/dev/null | sed 's/^/    /' || true
+        printf '%s\n' "  ${C_DIM}--- end ---${C_RESET}"
     else
         info "  ~/.gitconfig file: (not present)"
     fi

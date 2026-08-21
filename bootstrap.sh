@@ -1662,52 +1662,292 @@ run_git_config() { # run_git_config KEY VALUE   (as the target user)
     run_user "$TARGET_USER" git config --global "$1" "$2" >/dev/null 2>&1
 }
 
+# ----------------------------------------------------------------------------
+#  SSH helpers
+# ----------------------------------------------------------------------------
+# Find an existing SSH private key for TARGET_USER, preferring ed25519.
+# Prints the private key path to stdout and returns 0 if found.
+_find_existing_ssh_key() {
+    local ssh_dir="$TARGET_HOME/.ssh"
+    local cand
+    for cand in id_ed25519 id_ecdsa id_rsa id_ed25519_sk id_ecdsa_sk; do
+        if run_user "$TARGET_USER" bash -c "test -f \"$ssh_dir/$cand\"" 2>/dev/null; then
+            printf '%s' "$ssh_dir/$cand"
+            return 0
+        fi
+    done
+    # Fallback: any *.pub with a matching private key (covers custom names)
+    local pubs
+    pubs="$(run_user "$TARGET_USER" bash -c "ls -1 \"$ssh_dir\"/*.pub 2>/dev/null" || true)"
+    local pub
+    while IFS= read -r pub; do
+        [[ -z "$pub" ]] && continue
+        local priv="${pub%.pub}"
+        if run_user "$TARGET_USER" bash -c "test -f \"$priv\"" 2>/dev/null; then
+            printf '%s' "$priv"
+            return 0
+        fi
+    done <<< "$pubs"
+    return 1
+}
+
+# Report existing git + SSH signing configuration for TARGET_USER.
+# Prints a human-readable summary and returns 0 if signing looks fully configured.
+_report_git_signing_status() {
+    local fmt sk gpgsign tag_sign allowed email name
+    fmt="$(run_user "$TARGET_USER" git config --global --get gpg.format 2>/dev/null || echo "")"
+    sk="$(run_user "$TARGET_USER" git config --global --get user.signingkey 2>/dev/null || echo "")"
+    gpgsign="$(run_user "$TARGET_USER" git config --global --get commit.gpgsign 2>/dev/null || echo "")"
+    tag_sign="$(run_user "$TARGET_USER" git config --global --get tag.gpgsign 2>/dev/null || echo "")"
+    allowed="$(run_user "$TARGET_USER" git config --global --get gpg.ssh.allowedSignersFile 2>/dev/null || echo "")"
+    email="$(run_user "$TARGET_USER" git config --global --get user.email 2>/dev/null || echo "")"
+    name="$(run_user "$TARGET_USER" git config --global --get user.name 2>/dev/null || echo "")"
+
+    local has_key=0 has_allowed=0 has_pub=0
+    local key_path="" pub_path=""
+    if [[ -n "$sk" ]]; then
+        # signingkey may be a path to .pub or the key material itself
+        if [[ "$sk" == ssh-* ]]; then
+            has_pub=1
+            info "  git user.signingkey is inline key material (ssh-...)"
+        elif run_user "$TARGET_USER" bash -c "test -f \"$sk\"" 2>/dev/null; then
+            has_pub=1
+            pub_path="$sk"
+            key_path="${sk%.pub}"
+            if run_user "$TARGET_USER" bash -c "test -f \"$key_path\"" 2>/dev/null; then has_key=1; fi
+            info "  git user.signingkey: $sk $(run_user "$TARGET_USER" ssh-keygen -l -f "$sk" 2>/dev/null | sed 's/^/  /' || echo "")"
+        else
+            warn "  git user.signingkey: $sk (file not found)"
+        fi
+    else
+        info "  git user.signingkey: (not set)"
+    fi
+
+    if [[ -n "$allowed" ]]; then
+        if run_user "$TARGET_USER" bash -c "test -f \"$allowed\"" 2>/dev/null; then
+            has_allowed=1
+            info "  git gpg.ssh.allowedSignersFile: $allowed ($(run_user "$TARGET_USER" bash -c "wc -l < \"$allowed\" 2>/dev/null" || echo "?") line(s))"
+            run_user "$TARGET_USER" bash -c "sed 's/^/    /' \"$allowed\" 2>/dev/null | head -n 5" || true
+        else
+            warn "  git gpg.ssh.allowedSignersFile: $allowed (file not found)"
+        fi
+    else
+        info "  git gpg.ssh.allowedSignersFile: (not set)"
+    fi
+
+    info "  git gpg.format: ${fmt:-(not set)}"
+    info "  git commit.gpgsign: ${gpgsign:-(not set)}  tag.gpgsign: ${tag_sign:-(not set)}"
+    info "  git user.name: ${name:-(not set)}  user.email: ${email:-(not set)}"
+
+    # Check GitHub side if gh is authenticated
+    if command -v gh >/dev/null 2>&1 && run_user "$TARGET_USER" bash -c 'gh auth status >/dev/null 2>&1'; then
+        local pubkey_for_check=""
+        if [[ -n "$pub_path" ]] && run_user "$TARGET_USER" bash -c "test -f \"$pub_path\"" 2>/dev/null; then
+            pubkey_for_check="$(run_user "$TARGET_USER" bash -c "cut -d' ' -f2 < \"$pub_path\"" 2>/dev/null || echo "")"
+        elif [[ -n "$sk" && "$sk" == ssh-* ]]; then
+            pubkey_for_check="$(printf '%s' "$sk" | cut -d' ' -f2)"
+        else
+            # fallback to detected key
+            local det="$( _find_existing_ssh_key 2>/dev/null || echo "")"
+            if [[ -n "$det" ]]; then
+                pubkey_for_check="$(run_user "$TARGET_USER" bash -c "cut -d' ' -f2 < \"${det}.pub\"" 2>/dev/null || echo "")"
+            fi
+        fi
+        if [[ -n "$pubkey_for_check" ]]; then
+            local has_auth=0 has_sign=0
+            if run_user "$TARGET_USER" bash -c "gh api user/keys --paginate 2>/dev/null | grep -qF \"$pubkey_for_check\"" 2>/dev/null; then has_auth=1; fi
+            if run_user "$TARGET_USER" bash -c "gh api user/ssh_signing_keys --paginate 2>/dev/null | grep -qF \"$pubkey_for_check\"" 2>/dev/null; then has_sign=1; fi
+            if [[ $has_auth -eq 1 ]]; then ok "  GitHub authentication key: present (push/pull will work)"; else warn "  GitHub authentication key: NOT found (push will fail until uploaded)"; fi
+            if [[ $has_sign -eq 1 ]]; then ok "  GitHub SSH signing key: present (commits will show Verified)"; else warn "  GitHub SSH signing key: NOT found (commits will show Unverified until uploaded)"; fi
+        else
+            info "  GitHub keys: (no local pubkey to check against)"
+        fi
+    else
+        info "  GitHub keys: (gh not authenticated — run 'gh auth login' to check/upload)"
+    fi
+
+    # Return 0 only if core signing looks fully configured
+    if [[ "$fmt" == "ssh" && "$gpgsign" == "true" && $has_pub -eq 1 && $has_allowed -eq 1 ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Report existing local SSH key status (for passwordless login)
+_report_ssh_key_status() {
+    local ssh_dir="$TARGET_HOME/.ssh"
+    local existing
+    if existing="$(_find_existing_ssh_key 2>/dev/null)"; then
+        local pub="${existing}.pub"
+        ok "  SSH key present: $existing"
+        if run_user "$TARGET_USER" bash -c "test -f \"$pub\"" 2>/dev/null; then
+            run_user "$TARGET_USER" ssh-keygen -l -f "$pub" 2>/dev/null | sed 's/^/    /' || true
+            run_user "$TARGET_USER" bash -c "cat \"$pub\" 2>/dev/null | sed 's/^/    /' | cut -c1-80" || true
+        else
+            warn "  public key missing at $pub (private exists but .pub not found)"
+        fi
+        # Show ssh config snippet if present
+        if [[ -f "$ssh_dir/config" ]]; then
+            info "  ~/.ssh/config exists ($(wc -l < "$ssh_dir/config" 2>/dev/null | tr -d ' ') lines)"
+            run_user "$TARGET_USER" bash -c "grep -E '^Host |IdentityFile|AddKeysToAgent' \"$ssh_dir/config\" 2>/dev/null | sed 's/^/    /'" || true
+        else
+            info "  ~/.ssh/config: (not present)"
+        fi
+        return 0
+    else
+        info "  SSH key: (none found in $ssh_dir — will generate ed25519 if requested)"
+        return 1
+    fi
+}
+
 _setup_ssh_signing() {
-    local ssh_dir="$TARGET_HOME/.ssh" key="$TARGET_HOME/.ssh/id_ed25519" pub="$TARGET_HOME/.ssh/id_ed25519.pub"
-    local email
+    local ssh_dir="$TARGET_HOME/.ssh"
+    local email key pub
     email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
     email="${email:-${TARGET_USER}@$(hostname)}"
 
-    asroot install -d -m 700 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$ssh_dir"
+    printf '\n%sCurrent signing config for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
+    if _report_git_signing_status; then
+        ok "git commit signing already fully configured"
+    else
+        info "git commit signing not yet fully configured"
+    fi
+    _report_ssh_key_status || true
+    printf '\n'
 
-    if [[ ! -f "$key" ]]; then
-        info "generating a fresh ed25519 SSH key (new per machine)"
+    asroot install -d -m 700 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$ssh_dir"
+    # Ensure openssh-client (provides ssh-keygen, ssh-copy-id) is available
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        info "installing openssh-client (ssh-keygen)..."
+        _pm_install openssh-client 2>/dev/null || warn "could not install openssh-client"
+    fi
+
+    # Detect existing key or generate a fresh one
+    local existing
+    if existing="$(_find_existing_ssh_key)"; then
+        key="$existing"
+        pub="${key}.pub"
+        # If pub is missing (e.g. only private was kept), derive it
+        if ! run_user "$TARGET_USER" bash -c "test -f \"$pub\"" 2>/dev/null; then
+            info "public key missing for $key; deriving from private key..."
+            if run_user "$TARGET_USER" bash -c "ssh-keygen -y -f \"$key\" > \"$pub\" 2>/dev/null"; then
+                asroot chmod 644 "$pub" 2>/dev/null || true
+                asroot chown "$TARGET_USER:" "$pub" 2>/dev/null || true
+                ok "derived $pub from $key"
+            else
+                warn "could not derive public key for $key"
+            fi
+        fi
+        # Fix permissions (common cause of SSH ignored keys)
+        asroot chmod 700 "$ssh_dir" 2>/dev/null || true
+        asroot chmod 600 "$key" 2>/dev/null || true
+        asroot chmod 644 "$pub" 2>/dev/null || true
+        asroot chown -R "$TARGET_USER:" "$ssh_dir" 2>/dev/null || true
+        info "reusing existing ssh key at $key"
+        # Show fingerprint for confirmation
+        run_user "$TARGET_USER" ssh-keygen -l -f "$pub" 2>/dev/null | sed 's/^/  /' || true
+    else
+        key="$ssh_dir/id_ed25519"
+        pub="$key.pub"
+        info "no existing SSH key found; generating a fresh ed25519 key at $key"
         if [[ $EUID -eq 0 ]]; then
             run_user "$TARGET_USER" bash -c "ssh-keygen -t ed25519 -N '' -C '$email' -f '$key'" || { warn "ssh-keygen failed"; return 1; }
         else
             ssh-keygen -t ed25519 -N "" -C "$email" -f "$key" || { warn "ssh-keygen failed"; return 1; }
         fi
+        asroot chmod 600 "$key" 2>/dev/null || true
+        asroot chmod 644 "$pub" 2>/dev/null || true
         ok "generated $key"
         SSH_KEY_CREATED=1
         SSH_KEY_PATH="$key"
-    else
-        info "reusing existing ssh key at $key"
     fi
 
+    # Double-check pub exists and is readable as TARGET_USER
+    if ! run_user "$TARGET_USER" bash -c "test -f \"$pub\"" 2>/dev/null; then
+        err "public key not found at $pub after setup"
+        return 1
+    fi
     local pubkey
-    pubkey="$(cat "$pub")"
+    pubkey="$(run_user "$TARGET_USER" bash -c "cat \"$pub\"" 2>/dev/null)"
+    if [[ -z "$pubkey" ]]; then
+        err "public key at $pub is empty"
+        return 1
+    fi
 
-    if [[ -f "$ssh_dir/config" ]] && grep -q 'Host github.com' "$ssh_dir/config" 2>/dev/null; then
-        :
-    else
+    # SSH config: ensure github.com entry uses the correct IdentityFile and that
+    # a global AddKeysToAgent is set (helps both GitHub and passwordless hosts).
+    local cfg="$ssh_dir/config"
+    local need_github=1 need_global=1
+    if [[ -f "$cfg" ]]; then
+        run_user "$TARGET_USER" bash -c "grep -q 'Host github.com' \"$cfg\" 2>/dev/null" && need_github=0
+        run_user "$TARGET_USER" bash -c "grep -q 'AddKeysToAgent' \"$cfg\" 2>/dev/null" && need_global=0
+    fi
+    if [[ $need_global -eq 1 ]]; then
+        {
+            printf '\nHost *\n'
+            printf '    AddKeysToAgent yes\n'
+        } | asroot tee -a "$cfg" >/dev/null
+        asroot chmod 600 "$cfg" 2>/dev/null || true
+        asroot chown "$TARGET_USER:" "$cfg" 2>/dev/null || true
+        ok "added Host * AddKeysToAgent to $cfg"
+    fi
+    if [[ $need_github -eq 1 ]]; then
         {
             printf '\nHost github.com\n'
             printf '    HostName github.com\n'
             printf '    User git\n'
             printf '    IdentityFile %s\n' "$key"
             printf '    IdentitiesOnly yes\n'
-            printf '    AddKeysToAgent yes\n'
-        } | asroot tee -a "$ssh_dir/config" >/dev/null
-        asroot chmod 600 "$ssh_dir/config" 2>/dev/null || true
-        asroot chown "$TARGET_USER:" "$ssh_dir/config" 2>/dev/null || true
-        ok "github.com entry added to $ssh_dir/config"
+        } | asroot tee -a "$cfg" >/dev/null
+        asroot chmod 600 "$cfg" 2>/dev/null || true
+        asroot chown "$TARGET_USER:" "$cfg" 2>/dev/null || true
+        ok "github.com entry added to $cfg (IdentityFile $key)"
+    else
+        # Existing entry may point at wrong key (e.g. old ed25519 path); update it
+        if run_user "$TARGET_USER" bash -c "grep -A5 'Host github.com' \"$cfg\" 2>/dev/null | grep -q \"IdentityFile\"" 2>/dev/null; then
+            local current_id
+            current_id="$(run_user "$TARGET_USER" bash -c "awk '/Host github.com/{f=1;next} f && /IdentityFile/{print \$2; exit}' \"$cfg\"" 2>/dev/null)"
+            if [[ -n "$current_id" && "$current_id" != "$key" ]]; then
+                warn "github.com IdentityFile in $cfg is $current_id, updating to $key"
+                # Replace only the IdentityFile line under Host github.com
+                run_user "$TARGET_USER" bash -c "
+                    awk -v newkey=\"$key\" '
+                        /Host github.com/{in_github=1}
+                        in_github && /IdentityFile/{sub(/IdentityFile.*/, \"    IdentityFile \" newkey); in_github=0}
+                        {print}
+                        /^Host / && !/Host github.com/{in_github=0}
+                    ' \"$cfg\" > \"$cfg.tmp\" && mv \"$cfg.tmp\" \"$cfg\"
+                " 2>/dev/null || true
+                asroot chown "$TARGET_USER:" "$cfg" 2>/dev/null || true
+                ok "updated github.com IdentityFile to $key"
+            fi
+        fi
     fi
 
+    # allowed_signers: format is "PRINCIPAL SPACED_PUBKEY" (e.g. "user@host ssh-ed25519 AAAAC3... user@host")
+    # Previous bug used "email pubkey email" (duplicate trailing principal). Fix by using single principal.
     local tmp
     tmp="$(new_tmp)"
-    printf '%s %s %s\n' "$email" "$pubkey" "$email" > "$tmp"
-    asroot install -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 600 "$tmp" "$ssh_dir/allowed_signers"
-    rm -f "$tmp"
+    printf '%s %s\n' "$email" "$pubkey" > "$tmp"
+    # If allowed_signers already contains this exact pubkey, don't duplicate
+    local key_material
+    key_material="$(printf '%s' "$pubkey" | cut -d' ' -f2)"
+    if [[ -f "$ssh_dir/allowed_signers" ]] && grep -qF "$key_material" "$ssh_dir/allowed_signers" 2>/dev/null; then
+        info "allowed_signers already contains this key; leaving it in place"
+        rm -f "$tmp"
+    else
+        # If allowed_signers exists and has other keys, preserve them and append this one.
+        if [[ -f "$ssh_dir/allowed_signers" ]] && ! grep -qF "$key_material" "$ssh_dir/allowed_signers" 2>/dev/null; then
+            local merged
+            merged="$(new_tmp)"
+            cat "$ssh_dir/allowed_signers" > "$merged" 2>/dev/null || true
+            cat "$tmp" >> "$merged"
+            mv "$merged" "$tmp"
+        fi
+        asroot install -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 600 "$tmp" "$ssh_dir/allowed_signers"
+        rm -f "$tmp"
+        ok "wrote $ssh_dir/allowed_signers (principal: $email)"
+    fi
 
     run_git_config gpg.format ssh
     run_git_config user.signingkey "$pub"
@@ -1716,14 +1956,60 @@ _setup_ssh_signing() {
     run_git_config gpg.ssh.allowedSignersFile "$ssh_dir/allowed_signers"
     ok "git commit signing (ssh) configured with $pub"
 
+    # --- GitHub upload: distinguish authentication vs signing keys ---
+    # Authentication keys (push/pull) live at /user/keys, signing keys at /user/ssh_signing_keys.
+    # The old script only uploaded an authentication key, so commits showed "Unverified"
+    # even though push worked. Now we upload both when gh is authenticated.
     if command -v gh >/dev/null 2>&1 && run_user "$TARGET_USER" bash -c 'gh auth status >/dev/null 2>&1'; then
-        if run_user "$TARGET_USER" bash -c "gh auth refresh -h github.com -s write:public_key && gh ssh-key add '$pub' -t 'bootstrap-$(hostname)'"; then
-            ok "ssh public key uploaded to GitHub"
+        local title="bootstrap-$(hostname)-$(date +%Y%m%d)"
+        local already_auth=0 already_sign=0
+
+        # Check auth key exists (match by key material to avoid duplicate titles)
+        if run_user "$TARGET_USER" bash -c "gh api user/keys --paginate 2>/dev/null | grep -qF \"$key_material\"" 2>/dev/null; then
+            already_auth=1
+            info "GitHub authentication key already present (skipping upload)"
         else
-            warn "couldn't upload key to GitHub (may already exist)"
+            if run_user "$TARGET_USER" bash -c "gh ssh-key add \"$pub\" --title \"$title-auth\" 2>/dev/null"; then
+                ok "SSH authentication key uploaded to GitHub (for git push/pull)"
+            else
+                # gh ssh-key add may fail if title exists; try with unique title
+                if run_user "$TARGET_USER" bash -c "gh ssh-key add \"$pub\" --title \"$title-auth-\$(date +%s)\" 2>/dev/null"; then
+                    ok "SSH authentication key uploaded to GitHub"
+                else
+                    warn "couldn't upload authentication key to GitHub (may already exist or need 'gh auth refresh -h github.com -s write:public_key')"
+                fi
+            fi
+        fi
+
+        # Check signing key exists
+        if run_user "$TARGET_USER" bash -c "gh api user/ssh_signing_keys --paginate 2>/dev/null | grep -qF \"$key_material\"" 2>/dev/null; then
+            already_sign=1
+            info "GitHub SSH signing key already present (commits will show Verified)"
+        else
+            # need admin:public_key or write:public_key scope; try refresh then upload via api
+            run_user "$TARGET_USER" bash -c "gh auth refresh -h github.com -s write:public_key 2>/dev/null" || true
+            # Use gh api to create ssh_signing_key (gh ssh-key add does NOT create signing keys)
+            if run_user "$TARGET_USER" bash -c "gh api --method POST user/ssh_signing_keys -f title=\"$title-sign\" -f key=\"\$(cat \"$pub\")\" >/dev/null 2>&1"; then
+                ok "SSH signing key uploaded to GitHub (commits will show Verified)"
+            else
+                # Fallback: try with full pubkey line quoted
+                if run_user "$TARGET_USER" bash -c "cat \"$pub\" | xargs -I{} gh api --method POST user/ssh_signing_keys -f title=\"$title-sign-\$(date +%s)\" -f key=\"{}\" >/dev/null 2>&1"; then
+                    ok "SSH signing key uploaded to GitHub (fallback)"
+                else
+                    warn "couldn't upload SSH signing key to GitHub; add manually:"
+                    warn "  gh api --method POST user/ssh_signing_keys -f title=\"$title-sign\" -f key=\"\$(cat $pub)\""
+                    warn "  or add at https://github.com/settings/keys (SSH signing keys -> New SSH signing key)"
+                fi
+            fi
+        fi
+
+        if [[ $already_auth -eq 1 && $already_sign -eq 1 ]]; then
+            ok "GitHub keys already up to date"
         fi
     else
-        warn "gh not authenticated yet; add the key manually:  gh ssh-key add $pub"
+        warn "gh not authenticated yet; add keys manually after 'gh auth login':"
+        warn "  gh ssh-key add $pub --title \"\$(hostname)-auth\""
+        warn "  gh api --method POST user/ssh_signing_keys -f title=\"\$(hostname)-sign\" -f key=\"\$(cat $pub)\""
     fi
     return 0
 }
@@ -1731,30 +2017,161 @@ _setup_ssh_signing() {
 # One-time check that SSH commit signing actually works: create a scratch repo
 # as the target user, make a signed commit, and verify the signature is Good.
 _validate_git_signing() {
-    local repo sig
+    local repo sig email pub signing_key allowed
     repo="$(new_tmpdir)"
     asroot chown -R "$TARGET_USER:" "$repo" 2>/dev/null || true
+
+    # Use the actual configured email/signingkey/allowedSigners so the test
+    # matches the real repo config (previous version used a fake test email
+    # that never matched allowed_signers, so it always reported failure).
+    email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
+    email="${email:-${TARGET_USER}@$(hostname)}"
+    signing_key="$(run_user "$TARGET_USER" git config --global user.signingkey 2>/dev/null)"
+    allowed="$(run_user "$TARGET_USER" git config --global gpg.ssh.allowedSignersFile 2>/dev/null)"
+    # Fall back to detected key if git config not yet set
+    if [[ -z "$signing_key" ]]; then
+        local _detected
+        _detected="$(_find_existing_ssh_key 2>/dev/null || true)"
+        if [[ -n "$_detected" ]]; then
+            signing_key="${_detected}.pub"
+        else
+            signing_key="$TARGET_HOME/.ssh/id_ed25519.pub"
+        fi
+    fi
+    if [[ -z "$allowed" ]]; then
+        allowed="$TARGET_HOME/.ssh/allowed_signers"
+    fi
+    pub="$signing_key"
+
     if ! run_user "$TARGET_USER" bash -c "
         cd '$repo' && git init -q &&
-        git config user.name 'Bootstrap Test' &&
-        git config user.email 'bootstrap-test@localhost' &&
+        git config user.name \"\$(git config --global user.name 2>/dev/null || echo 'Bootstrap Test')\" &&
+        git config user.email '$email' &&
         git config gpg.format ssh &&
-        git config user.signingkey '$TARGET_HOME/.ssh/id_ed25519.pub' &&
-        git config gpg.ssh.allowedSignersFile '$TARGET_HOME/.ssh/allowed_signers' &&
+        git config user.signingkey '$pub' &&
+        git config gpg.ssh.allowedSignersFile '$allowed' &&
         git config commit.gpgsign true &&
         echo 'signing test' > test.txt && git add test.txt &&
         git commit -q -m 'bootstrap signing test'
     "; then
         err "test commit for signing verification failed"
+        info "hint: check that $pub exists, $allowed contains '$email \$(cat $pub 2>/dev/null | cut -c1-60)...', and that git >= 2.34 is installed"
         return 1
     fi
-    sig="$(run_user "$TARGET_USER" bash -c "cd '$repo' && git log -1 --format='%G? %H' 2>/dev/null")"
-    if [[ "$sig" == "G "* ]]; then
+    sig="$(run_user "$TARGET_USER" bash -c "cd '$repo' && git log -1 --format='%G? %GP %H' 2>/dev/null")"
+    if [[ "$sig" == G* ]]; then
         ok "commit signing verified (Good signature): $sig"
         return 0
     fi
-    err "commit signature not verified ($sig)"
+    err "commit signature not verified ($sig) - expected 'G ...' (Good)"
+    info "allowed_signers ($allowed):"
+    run_user "$TARGET_USER" bash -c "cat \"$allowed\" 2>/dev/null | sed 's/^/  /'" || true
+    info "signing key ($pub):"
+    run_user "$TARGET_USER" bash -c "cat \"$pub\" 2>/dev/null | sed 's/^/  /'" || true
+    # Also show git verify output for deeper debugging
+    run_user "$TARGET_USER" bash -c "cd '$repo' && git verify-commit HEAD 2>&1 | sed 's/^/  /'" || true
     return 1
+}
+
+# Offer to set up key-based (passwordless) SSH login to one or more remote
+# hosts via ssh-copy-id (or manual fallback). This is INDEPENDENT from
+# git/GitHub: it copies your PUBLIC key to the remote's ~/.ssh/authorized_keys
+# so `ssh user@host` needs no password. GitHub uses two *different* objects
+# for the same key: an "authentication key" for push/pull and a "signing key"
+# for Verified commits — this function touches neither.
+_setup_passwordless_ssh() {
+    local ssh_dir="$TARGET_HOME/.ssh"
+    local key pub
+
+    printf '\n%sCurrent SSH key status for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
+    _report_ssh_key_status || true
+    printf '\n'
+
+    key="$(_find_existing_ssh_key 2>/dev/null || echo "$ssh_dir/id_ed25519")"
+    pub="${key}.pub"
+
+    # If no key exists yet, offer to create one (reuses _setup_ssh_signing logic lightly)
+    if ! run_user "$TARGET_USER" bash -c "test -f \"$key\" && test -f \"$pub\"" 2>/dev/null; then
+        if ! confirm "No SSH key found at $key - generate one now for passwordless login?" y; then
+            info "skipping passwordless SSH setup (no key)"
+            return 0
+        fi
+        local email
+        email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
+        email="${email:-${TARGET_USER}@$(hostname)}"
+        asroot install -d -m 700 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$ssh_dir"
+        if [[ $EUID -eq 0 ]]; then
+            run_user "$TARGET_USER" bash -c "ssh-keygen -t ed25519 -N '' -C '$email' -f '$key'" || { warn "ssh-keygen failed"; return 1; }
+        else
+            ssh-keygen -t ed25519 -N "" -C "$email" -f "$key" || { warn "ssh-keygen failed"; return 1; }
+        fi
+        asroot chmod 600 "$key" 2>/dev/null || true
+        asroot chmod 644 "$pub" 2>/dev/null || true
+        ok "generated $key"
+        SSH_KEY_CREATED=1
+        SSH_KEY_PATH="$key"
+    fi
+
+    if ! confirm "Set up passwordless SSH login to a remote host (copy your public key so 'ssh user@host' needs no password)?" n; then
+        return 0
+    fi
+
+    # Ensure ssh-copy-id / ssh are available
+    if ! command -v ssh >/dev/null 2>&1 && ! run_user "$TARGET_USER" bash -c "command -v ssh >/dev/null 2>&1"; then
+        info "installing openssh-client..."
+        _pm_install openssh-client 2>/dev/null || warn "could not install openssh-client"
+    fi
+
+    info "using public key: $pub"
+    run_user "$TARGET_USER" bash -c "cat \"$pub\" 2>/dev/null | sed 's/^/  /'" || true
+
+    while true; do
+        read_line "Remote for passwordless SSH (e.g. user@host or host, leave empty to finish): "
+        local dest="${REPLY:-}"
+        dest="${dest#ssh }"
+        [[ -z "$dest" ]] && break
+
+        info "copying $pub to $dest ..."
+
+        local copy_ok=0
+        # Prefer ssh-copy-id when available (handles authorized_keys creation + perms)
+        if run_user "$TARGET_USER" bash -c "command -v ssh-copy-id >/dev/null 2>&1"; then
+            if run_user "$TARGET_USER" bash -c "ssh-copy-id -i \"$pub\" \"$dest\" 2>&1 | sed 's/^/  /'"; then
+                copy_ok=1
+            else
+                warn "ssh-copy-id failed for $dest"
+            fi
+        else
+            warn "ssh-copy-id not found, using manual 'cat >> authorized_keys' fallback"
+            if run_user "$TARGET_USER" bash -c "cat \"$pub\" | ssh -o StrictHostKeyChecking=accept-new \"$dest\" 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo ok' 2>&1 | grep -q ok"; then
+                copy_ok=1
+            else
+                warn "manual copy failed for $dest"
+            fi
+        fi
+
+        if [[ $copy_ok -eq 1 ]]; then
+            ok "key copied to $dest"
+            info "testing passwordless login to $dest (BatchMode)..."
+            if run_user "$TARGET_USER" bash -c "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \"$dest\" 'echo ok' 2>&1 | grep -q ok"; then
+                ok "passwordless SSH to $dest verified (no password needed)"
+            else
+                warn "still requires password or host unreachable"
+                info "  test manually: ssh -o BatchMode=yes $dest 'echo ok'"
+                info "  retry: ssh-copy-id -i $pub $dest"
+            fi
+        else
+            warn "copy failed; you can retry manually: ssh-copy-id -i $pub $dest"
+        fi
+
+        if ! confirm "Set up another host?" n; then
+            break
+        fi
+    done
+
+    info "tip: if you generated a key with a passphrase you will still be prompted;"
+    info "     run 'ssh-add $key' or ensure Host * AddKeysToAgent yes is in $ssh_dir/config (already added above)"
+    return 0
 }
 
 step_configs() {
@@ -1762,8 +2179,30 @@ step_configs() {
     if ! confirm "Install dotfiles (git, ghostty, claude code, opencode, tmux)?" y; then return 0; fi
     local home="$TARGET_HOME"
 
-    if confirm "Set up ~/.gitconfig (asks for your name/email)?" y; then
+    # Show existing git identity/signing config before asking to overwrite
+    printf '\n%sExisting git config for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
+    _report_git_signing_status || true
+    if [[ -f "$home/.gitconfig" ]]; then
+        info "  ~/.gitconfig file: exists at $home/.gitconfig"
+    else
+        info "  ~/.gitconfig file: (not present)"
+    fi
+    printf '\n'
+
+    local gitconfig_prompt="Set up ~/.gitconfig (asks for your name/email)?"
+    local gitconfig_default="y"
+    if [[ -f "$home/.gitconfig" ]]; then
+        gitconfig_prompt="~/.gitconfig already exists — overwrite with new name/email?"
+        gitconfig_default="n"
+    fi
+    if confirm "$gitconfig_prompt" "$gitconfig_default"; then
         _write_file "$home/.gitconfig" _gitconfig_content
+    else
+        if [[ -f "$home/.gitconfig" ]]; then
+            ok "kept existing ~/.gitconfig"
+        else
+            info "skipped ~/.gitconfig"
+        fi
     fi
 
     if command -v ghostty >/dev/null 2>&1 && confirm "Write ghostty config?" y; then
@@ -1783,11 +2222,44 @@ step_configs() {
         _write_file "$home/.tmux.conf" _tmux_content
     fi
 
-    if confirm "Set up SSH key-based commit signing for git & GitHub?" y; then
+    # Report current signing state before prompting — so re-running the script
+    # clearly shows if signing is already set up or not.
+    local signing_already=1
+    if _report_git_signing_status >/dev/null 2>&1; then
+        signing_already=0
+    fi
+    # Re-report verbosely for the user before the prompt
+    printf '\n%sSSH commit signing status:%s\n' "$C_BOLD" "$C_RESET"
+    _report_git_signing_status || true
+    _report_ssh_key_status || true
+    printf '\n'
+
+    local signing_prompt="Set up SSH key-based commit signing for git & GitHub?"
+    local signing_default="y"
+    if [[ $signing_already -eq 0 ]]; then
+        signing_prompt="SSH commit signing already configured — reconfigure / re-upload to GitHub?"
+        signing_default="n"
+    fi
+    if confirm "$signing_prompt" "$signing_default"; then
         if _setup_ssh_signing; then
             _validate_git_signing || warn "commit signing validation failed; see messages above"
         fi
+    else
+        if [[ $signing_already -eq 0 ]]; then
+            ok "kept existing commit signing config"
+        else
+            info "skipped commit signing setup"
+        fi
     fi
+
+    # Passwordless SSH is fully separate from git/GitHub. It reuses the same
+    # local key pair (so you only manage one) but only touches the remote's
+    # authorized_keys — it does NOT upload to GitHub. GitHub auth vs signing
+    # are also distinct (see _setup_ssh_signing comments).
+    # _setup_passwordless_ssh reports its own existing-key status and then
+    # prompts, so no extra pre-report is needed here.
+    _setup_passwordless_ssh || warn "passwordless SSH setup incomplete"
+
     return 0
 }
 

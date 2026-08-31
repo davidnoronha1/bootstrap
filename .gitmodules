@@ -1,0 +1,3 @@
+[submodule "tools/scpt"]
+	path = tools/scpt
+	url = git@github.com:davidnoronha1/scpt.git

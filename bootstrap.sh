@@ -41,9 +41,10 @@ SKIP_TOOLCHAINS=0
 SKIP_VSCODE=0
 SKIP_CONFIGS=0
 SKIP_EXTRAS=0
+SKIP_SCPT=0
 USER_FLAG=""
 RESULTS=()
-STEPS_TOTAL=12
+STEPS_TOTAL=13
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 INSTALLED_LOG="$HOME/.local/var/bootstrap-managed.txt"
 
@@ -2364,6 +2365,145 @@ step_extras() {
 }
 
 # ----------------------------------------------------------------------------
+#  Step: scpt (tmux SSH helper + file transfer)
+# ----------------------------------------------------------------------------
+_install_scpt() {
+    local src="" found="" tmpdir
+    local candidates=(
+        "$SCRIPT_DIR/tools/scpt/scpt.sh"
+        "$SCRIPT_DIR/../tools/scpt/scpt.sh"
+        "$FILES_DIR/../tools/scpt/scpt.sh"
+        "./tools/scpt/scpt.sh"
+        "$HOME/bootstrap/tools/scpt/scpt.sh"
+    )
+    for src in "${candidates[@]}"; do
+        if [[ -f "$src" ]]; then found="$src"; break; fi
+    done
+    # Remote/curl mode fallback: clone from GitHub
+    if [[ -z "$found" ]]; then
+        info "scpt source not found locally, cloning from GitHub..."
+        tmpdir="$(new_tmpdir)"
+        if command -v git >/dev/null 2>&1 && git clone --depth 1 https://github.com/davidnoronha1/scpt.git "$tmpdir/scpt" 2>/dev/null; then
+            found="$tmpdir/scpt/scpt.sh"
+        else
+            # last resort: fetch single file via curl
+            if command -v curl >/dev/null 2>&1 && curl -fsSL https://raw.githubusercontent.com/davidnoronha1/scpt/main/scpt.sh -o "$tmpdir/scpt.sh" 2>/dev/null; then
+                found="$tmpdir/scpt.sh"
+            else
+                err "could not obtain scpt.sh (no local file, git/curl fallback failed)"
+                return 1
+            fi
+        fi
+    else
+        # source found locally — if we haven't set tmpdir, set it for sft fallback logic
+        tmpdir="${tmpdir:-$(new_tmpdir)}"
+        # if local source is from a git checkout, tmpdir/scpt may not exist; that's fine
+        # we will resolve sft relative to found's directory below
+        :
+    fi
+    ensure_user_dirs
+    local g
+    g="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    local dest="$TARGET_HOME/.local/bin/scpt"
+    if asroot install -D -o "$TARGET_USER" -g "$g" -m 0755 "$found" "$dest"; then
+        ok "scpt installed to $dest"
+        asroot ln -sf "$dest" /usr/local/bin/scpt 2>/dev/null || true
+        # keep sht/sht.sh aliases for backward compat (old name)
+        asroot ln -sf "$dest" /usr/local/bin/sht 2>/dev/null || true
+        asroot ln -sf "$dest" "$TARGET_HOME/.local/bin/sht" 2>/dev/null || true
+        run_user "$TARGET_USER" bash -c "ln -sf '$dest' '$TARGET_HOME/.local/bin/sht'" 2>/dev/null || true
+        register_managed "scpt" "tarball" "$dest"
+    else
+        err "failed to install scpt to $dest"
+        return 1
+    fi
+
+    # companion: sft (file transfer, lives alongside scpt in tools/scpt/sft/sft.py)
+    local sft_src="" sft_found="" sft_dest="$TARGET_HOME/.local/bin/sft"
+    local sft_candidates=(
+        "$(dirname "$found")/sft/sft.py"
+        "$SCRIPT_DIR/tools/scpt/sft/sft.py"
+        "$SCRIPT_DIR/../tools/scpt/sft/sft.py"
+        "$FILES_DIR/../tools/scpt/sft/sft.py"
+        "./tools/scpt/sft/sft.py"
+        "$HOME/bootstrap/tools/scpt/sft/sft.py"
+        "${tmpdir}/scpt/sft/sft.py"
+    )
+    for sft_src in "${sft_candidates[@]}"; do
+        if [[ -f "$sft_src" ]]; then sft_found="$sft_src"; break; fi
+    done
+    if [[ -z "$sft_found" ]]; then
+        # try fetching sft.py via curl if scpt was fetched standalone
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL https://raw.githubusercontent.com/davidnoronha1/scpt/main/sft/sft.py -o "$tmpdir/sft.py" 2>/dev/null; then
+                sft_found="$tmpdir/sft.py"
+            fi
+        fi
+    fi
+    if [[ -n "$sft_found" ]]; then
+        if asroot install -D -o "$TARGET_USER" -g "$g" -m 0755 "$sft_found" "$sft_dest"; then
+            ok "sft installed to $sft_dest (companion to scpt)"
+            asroot ln -sf "$sft_dest" /usr/local/bin/sft 2>/dev/null || true
+            register_managed "sft" "tarball" "$sft_dest"
+        else
+            warn "failed to install sft to $sft_dest"
+        fi
+    else
+        warn "sft source not found; scpt file transfer (prefix+T) will be limited"
+        warn "  sft lives at tools/scpt/sft/sft.py in the scpt repo"
+    fi
+    return 0
+}
+
+step_scpt() {
+    ensure_user_dirs
+    # tmux is required for scpt; install if missing
+    if ! command -v tmux >/dev/null 2>&1; then
+        info "tmux not found (required for scpt), installing..."
+        if ! _pm_install tmux; then
+            warn "tmux install failed; scpt will be installed but needs tmux to run"
+        fi
+    else
+        ok "tmux already installed: $(tmux -V 2>/dev/null | head -1)"
+    fi
+    if ! command -v ssh >/dev/null 2>&1; then
+        info "openssh-client not found (required for scpt), installing..."
+        _pm_install openssh-client 2>/dev/null || _pm_install openssh 2>/dev/null || warn "openssh-client install failed"
+    fi
+    # optional: nmap for scan feature
+    if ! command -v nmap >/dev/null 2>&1; then
+        info "nmap not found (optional for 'scpt --scan'), skipping auto-install"
+    fi
+    if ! confirm "Install scpt (tmux SSH helper + file transfer)?" y; then return 0; fi
+    if user_cmd_exists scpt || [[ -x "$TARGET_HOME/.local/bin/scpt" ]]; then
+        ok "scpt already installed at $TARGET_HOME/.local/bin/scpt"
+        if confirm "Reinstall/overwrite scpt?" n; then
+            spinner "installing scpt" _install_scpt || warn "scpt install failed"
+        fi
+    else
+        if spinner "installing scpt" _install_scpt; then
+            ok "scpt installed: $(run_user "$TARGET_USER" scpt --help 2>/dev/null | head -1 || echo 'scpt --help for usage')"
+        else
+            warn "scpt install failed"
+            return 1
+        fi
+    fi
+    # Offer to bind prefix+c if inside tmux, but don't force
+    if command -v tmux >/dev/null 2>&1 && [[ -n "${TMUX:-}" ]]; then
+        if confirm "Bind prefix+c to scpt menu in this tmux server now?" y; then
+            if run_user "$TARGET_USER" bash -c "'$TARGET_HOME/.local/bin/scpt' --bind" 2>/dev/null || bash "$TARGET_HOME/.local/bin/scpt" --bind 2>/dev/null; then
+                ok "scpt binding installed (prefix+c)"
+            else
+                warn "scpt --bind failed; try 'scpt --bind' manually inside tmux"
+            fi
+        fi
+    else
+        info "run 'scpt --bind' inside tmux to bind prefix+c, or just run 'scpt' for the menu"
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 #  Summary
 # ----------------------------------------------------------------------------
 summary() {
@@ -2413,6 +2553,7 @@ Setup options:
   --skip-vscode          skip VS Code + extensions step
   --skip-configs         skip dotfiles step
   --skip-extras          skip extra apps (ffmpeg, microsoft edge)
+  --skip-scpt            skip scpt (tmux SSH helper + file transfer) step
   --tui-off              plain output, no colors/spinners
 
 Manage commands:
@@ -2452,6 +2593,9 @@ parse_args() {
             --skip-vscode) SKIP_VSCODE=1 ;;
             --skip-configs) SKIP_CONFIGS=1 ;;
             --skip-extras) SKIP_EXTRAS=1 ;;
+            --skip-scpt) SKIP_SCPT=1 ;;
+            --skip-sht) SKIP_SCPT=1 ;; # backward compat: old name
+            --skip-sft) SKIP_SCPT=1 ;; # backward compat: sft now part of scpt
             --tui-off) TUI_OFF=1 ;;
             -h|--help) usage; exit 0 ;;
             *) err "unknown option: $1"; usage; return 1 ;;
@@ -2506,6 +2650,14 @@ remote_bootstrap() {
             || { err "could not copy config files to $destline"; return 1; }
     else
         warn "no local config files dir; dotfile/config steps will be skipped on the target"
+    fi
+
+    # Also copy tools/scpt if present (so scpt step works remotely)
+    local tools_scpt="$SCRIPT_DIR/tools/scpt"
+    if [[ -d "$tools_scpt" ]]; then
+        info "copying scpt tool..."
+        tar -C "$SCRIPT_DIR" -cf - "tools/scpt" | ssh $destline "tar -xf - -C '$remote_dir'" \
+            || warn "could not copy scpt tool to $destline (scpt step will fallback to git clone)"
     fi
 
     # Forward the original flags but drop --files-dir (the copied files/ dir is
@@ -2631,6 +2783,7 @@ main() {
     if [[ $SKIP_VSCODE -eq 1 ]]; then skip_step "VS Code + extensions"; else run_step "VS Code + extensions" step_vscode; fi
     if [[ $SKIP_CONFIGS -eq 1 ]]; then skip_step "Dotfiles / configs"; else run_step "Dotfiles / configs" step_configs; fi
     if [[ $SKIP_EXTRAS -eq 1 ]]; then skip_step "Extra apps (ffmpeg, edge)"; else run_step "Extra apps (ffmpeg, edge)" step_extras; fi
+    if [[ $SKIP_SCPT -eq 1 ]]; then skip_step "scpt (tmux SSH helper + file transfer)"; else run_step "scpt (tmux SSH helper + file transfer)" step_scpt; fi
 
     ensure_home_ownership
     summary

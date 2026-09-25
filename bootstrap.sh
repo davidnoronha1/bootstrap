@@ -42,9 +42,10 @@ SKIP_VSCODE=0
 SKIP_CONFIGS=0
 SKIP_EXTRAS=0
 SKIP_SCPT=0
+SKIP_REC=0
 USER_FLAG=""
 RESULTS=()
-STEPS_TOTAL=13
+STEPS_TOTAL=14
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 INSTALLED_LOG="$HOME/.local/var/bootstrap-managed.txt"
 
@@ -450,7 +451,8 @@ skip_step() {
 #  System helpers
 # ----------------------------------------------------------------------------
 asroot() {
-    if [[ $EUID -eq 0 ]]; then "$@"
+    # `command` so e.g. `asroot install ...` runs /usr/bin/install, not our install() helper
+    if [[ $EUID -eq 0 ]]; then command "$@"
     elif command -v sudo >/dev/null 2>&1; then sudo "$@"
     else err "needs root privileges"; return 1; fi
 }
@@ -2504,6 +2506,92 @@ step_scpt() {
 }
 
 # ----------------------------------------------------------------------------
+#  Step: rec (ffmpeg screen recorder TUI, tools/rec)
+# ----------------------------------------------------------------------------
+_rec_deps() { # system packages rec needs, per package manager
+    case "$PM" in
+        apt)     printf '%s\n' x11-utils python3-tk python3-gi python3-venv slop libnotify-bin ;;
+        dnf|yum) printf '%s\n' xorg-x11-utils python3-tkinter python3-gobject slop libnotify ;;
+        pacman)  printf '%s\n' xorg-xwininfo tk python-gobject slop libnotify ;;
+        zypper)  printf '%s\n' xwininfo python3-tk python3-gobject slop libnotify-tools ;;
+        *)       return 1 ;;
+    esac
+}
+
+_install_rec() {
+    local src="" found="" tmpdir
+    local candidates=(
+        "$SCRIPT_DIR/tools/rec"
+        "$SCRIPT_DIR/../tools/rec"
+        "$FILES_DIR/../tools/rec"
+        "./tools/rec"
+        "$HOME/bootstrap/tools/rec"
+    )
+    for src in "${candidates[@]}"; do
+        if [[ -f "$src/main.py" && -d "$src/app" ]]; then found="$src"; break; fi
+    done
+    # Remote/curl mode fallback: rec lives in this repo
+    if [[ -z "$found" ]]; then
+        info "rec source not found locally, cloning bootstrap repo from GitHub..."
+        tmpdir="$(new_tmpdir)"
+        if command -v git >/dev/null 2>&1 \
+            && git clone --depth 1 https://github.com/davidnoronha1/bootstrap.git "$tmpdir/bootstrap" 2>/dev/null \
+            && [[ -f "$tmpdir/bootstrap/tools/rec/main.py" ]]; then
+            found="$tmpdir/bootstrap/tools/rec"
+        else
+            err "could not obtain tools/rec (no local copy, git clone failed)"
+            return 1
+        fi
+    fi
+
+    ensure_user_dirs
+    local g dest="$TARGET_HOME/.local/share/rec"
+    g="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
+    # Replace the code but keep an existing venv (faster reinstalls)
+    asroot install -d -o "$TARGET_USER" -g "$g" -m 0755 "$dest" || return 1
+    asroot find "$dest" -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} + || return 1
+    tar -C "$found" --exclude=__pycache__ --exclude=.venv -cf - . | asroot tar -xf - -C "$dest" || return 1
+    asroot chown -R "$TARGET_USER:$g" "$dest" || return 1
+    asroot chmod 0755 "$dest/rec" || return 1
+
+    # venv with system site-packages so PyGObject (tray) and tkinter come from the distro
+    if ! run_user "$TARGET_USER" bash -c "
+        set -e
+        [[ -x '$dest/.venv/bin/python3' ]] || python3 -m venv --system-site-packages '$dest/.venv'
+        '$dest/.venv/bin/python3' -m pip install -q --upgrade -r '$dest/requirements.txt'
+    "; then
+        err "failed to set up rec's python venv in $dest/.venv"
+        return 1
+    fi
+
+    run_user "$TARGET_USER" ln -sf "$dest/rec" "$TARGET_HOME/.local/bin/rec" || return 1
+    asroot ln -sf "$dest/rec" /usr/local/bin/rec 2>/dev/null || true
+    register_managed "rec" "tarball" "$dest"
+    ok "rec installed to $dest (run: rec)"
+}
+
+step_rec() {
+    if ! confirm "Install rec (ffmpeg screen recorder TUI)?" y; then return 0; fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        warn "ffmpeg not found; rec needs it (see the extras step)"
+    fi
+    local pkgs=() pkg
+    if mapfile -t pkgs < <(_rec_deps); then
+        [[ "$PM" == apt ]] && { apt_get update -qq || true; }
+        for pkg in "${pkgs[@]}"; do
+            spinner "installing $pkg" _pm_install "$pkg" || warn "$pkg install failed (rec may lose that feature)"
+        done
+    else
+        warn "no package list for '$PM'; install xwininfo, python3 tk + gobject, slop, notify-send manually"
+    fi
+    if [[ -x "$TARGET_HOME/.local/share/rec/rec" ]] && ! confirm "rec already installed; update it?" y; then
+        return 0
+    fi
+    spinner "installing rec" _install_rec || { warn "rec install failed"; return 1; }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 #  Summary
 # ----------------------------------------------------------------------------
 summary() {
@@ -2554,6 +2642,7 @@ Setup options:
   --skip-configs         skip dotfiles step
   --skip-extras          skip extra apps (ffmpeg, microsoft edge)
   --skip-scpt            skip scpt (tmux SSH helper + file transfer) step
+  --skip-rec             skip rec (ffmpeg screen recorder TUI) step
   --tui-off              plain output, no colors/spinners
 
 Manage commands:
@@ -2596,6 +2685,7 @@ parse_args() {
             --skip-scpt) SKIP_SCPT=1 ;;
             --skip-sht) SKIP_SCPT=1 ;; # backward compat: old name
             --skip-sft) SKIP_SCPT=1 ;; # backward compat: sft now part of scpt
+            --skip-rec) SKIP_REC=1 ;;
             --tui-off) TUI_OFF=1 ;;
             -h|--help) usage; exit 0 ;;
             *) err "unknown option: $1"; usage; return 1 ;;
@@ -2652,13 +2742,14 @@ remote_bootstrap() {
         warn "no local config files dir; dotfile/config steps will be skipped on the target"
     fi
 
-    # Also copy tools/scpt if present (so scpt step works remotely)
-    local tools_scpt="$SCRIPT_DIR/tools/scpt"
-    if [[ -d "$tools_scpt" ]]; then
-        info "copying scpt tool..."
-        tar -C "$SCRIPT_DIR" -cf - "tools/scpt" | ssh $destline "tar -xf - -C '$remote_dir'" \
-            || warn "could not copy scpt tool to $destline (scpt step will fallback to git clone)"
-    fi
+    # Also copy tools/ (scpt, rec) if present so those steps work remotely
+    local tool
+    for tool in scpt rec; do
+        [[ -d "$SCRIPT_DIR/tools/$tool" ]] || continue
+        info "copying $tool tool..."
+        tar -C "$SCRIPT_DIR" --exclude=__pycache__ --exclude=.venv -cf - "tools/$tool" | ssh $destline "tar -xf - -C '$remote_dir'" \
+            || warn "could not copy $tool tool to $destline ($tool step will fallback to git clone)"
+    done
 
     # Forward the original flags but drop --files-dir (the copied files/ dir is
     # used instead) and mark the remote run so it doesn't re-ask this question.
@@ -2784,6 +2875,7 @@ main() {
     if [[ $SKIP_CONFIGS -eq 1 ]]; then skip_step "Dotfiles / configs"; else run_step "Dotfiles / configs" step_configs; fi
     if [[ $SKIP_EXTRAS -eq 1 ]]; then skip_step "Extra apps (ffmpeg, edge)"; else run_step "Extra apps (ffmpeg, edge)" step_extras; fi
     if [[ $SKIP_SCPT -eq 1 ]]; then skip_step "scpt (tmux SSH helper + file transfer)"; else run_step "scpt (tmux SSH helper + file transfer)" step_scpt; fi
+    if [[ $SKIP_REC -eq 1 ]]; then skip_step "rec (screen recorder)"; else run_step "rec (screen recorder)" step_rec; fi
 
     ensure_home_ownership
     summary

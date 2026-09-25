@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Launcher script for ScreenRec Studio
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="$DIR:$PYTHONPATH"
-exec python3 "$DIR/main.py" "$@"
+# Launcher for rec. Resolves symlinks (e.g. ~/.local/bin/rec) and prefers the
+# bundled venv that bootstrap.sh creates, falling back to the system python.
+DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+PY="$DIR/.venv/bin/python3"
+[[ -x "$PY" ]] || PY=python3
+exec "$PY" "$DIR/main.py" "$@"

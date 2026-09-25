@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launcher script for ScreenRec Studio
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$DIR:$PYTHONPATH"
+exec python3 "$DIR/main.py" "$@"

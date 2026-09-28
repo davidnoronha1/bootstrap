@@ -28,27 +28,67 @@ def get_display_env() -> str:
     return os.environ.get("DISPLAY", ":0")
 
 
-def get_screen_resolution() -> Tuple[int, int]:
-    """Detect full screen resolution using xdpyinfo, xrandr, or fallback."""
-    # Try xdpyinfo
+def get_native_screen_geometry() -> Tuple[int, int, int, int]:
+    """Detect primary or active screen native geometry (width, height, offset_x, offset_y).
+
+    Queries xrandr for connected monitors and their preferred (native) EDID mode
+    and offset. Falls back to xdpyinfo, tkinter, or (1920, 1080, 0, 0).
+    """
+    # 1. Try xrandr for monitor-specific native resolution and offset
+    try:
+        out = subprocess.check_output(["xrandr", "--current"], stderr=subprocess.DEVNULL, text=True)
+        lines = out.splitlines()
+        monitors = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if " connected" in line:
+                name = line.split()[0]
+                is_primary = " primary " in line
+                m_geom = re.search(r"(\d+)x(\d+)\+(\d+)\+(\d+)", line)
+                geom = tuple(map(int, m_geom.groups())) if m_geom else None
+
+                preferred_res = None
+                current_res = None
+                j = i + 1
+                while j < len(lines) and (lines[j].startswith("   ") or lines[j].startswith("\t")):
+                    mode_line = lines[j]
+                    m_mode = re.search(r"^\s*(\d+)x(\d+)", mode_line)
+                    if m_mode:
+                        mw, mh = int(m_mode.group(1)), int(m_mode.group(2))
+                        if "+" in mode_line and not preferred_res:
+                            preferred_res = (mw, mh)
+                        if "*" in mode_line and not current_res:
+                            current_res = (mw, mh)
+                    j += 1
+
+                w, h = preferred_res or current_res or ((geom[0], geom[1]) if geom else (1920, 1080))
+                gx = geom[2] if geom else 0
+                gy = geom[3] if geom else 0
+                w = max(32, w - (w % 2))
+                h = max(32, h - (h % 2))
+                monitors.append({"name": name, "primary": is_primary, "x": gx, "y": gy, "width": w, "height": h})
+                i = j - 1
+            i += 1
+
+        if monitors:
+            target = next((m for m in monitors if m["primary"]), monitors[0])
+            return target["width"], target["height"], target["x"], target["y"]
+    except Exception:
+        pass
+
+    # 2. Try xdpyinfo for X11 screen dimensions
     try:
         out = subprocess.check_output(["xdpyinfo"], stderr=subprocess.DEVNULL, text=True)
         m = re.search(r"dimensions:\s+(\d+)x(\d+)\s+pixels", out)
         if m:
-            return int(m.group(1)), int(m.group(2))
+            w = int(m.group(1))
+            h = int(m.group(2))
+            return max(32, w - (w % 2)), max(32, h - (h % 2)), 0, 0
     except Exception:
         pass
 
-    # Try xrandr
-    try:
-        out = subprocess.check_output(["xrandr", "--current"], stderr=subprocess.DEVNULL, text=True)
-        m = re.search(r"current\s+(\d+)\s*x\s*(\d+)", out)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    except Exception:
-        pass
-
-    # Fallback to tkinter
+    # 3. Fallback to tkinter
     try:
         import tkinter as tk
         root = tk.Tk()
@@ -57,11 +97,17 @@ def get_screen_resolution() -> Tuple[int, int]:
         h = root.winfo_screenheight()
         root.destroy()
         if w > 0 and h > 0:
-            return w, h
+            return max(32, w - (w % 2)), max(32, h - (h % 2)), 0, 0
     except Exception:
         pass
 
-    return 1920, 1080
+    return 1920, 1080, 0, 0
+
+
+def get_screen_resolution() -> Tuple[int, int]:
+    """Detect screen native resolution (width, height)."""
+    w, h, _, _ = get_native_screen_geometry()
+    return w, h
 
 
 def parse_xwininfo_output(text: str) -> Optional[WindowInfo]:

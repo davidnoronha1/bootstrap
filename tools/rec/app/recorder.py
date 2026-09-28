@@ -12,7 +12,12 @@ import threading
 import time
 from typing import Callable, List, Optional, Tuple
 
-from app.capture_targets import get_display_env, get_screen_resolution, get_window_by_id
+from app.capture_targets import (
+    get_display_env,
+    get_native_screen_geometry,
+    get_screen_resolution,
+    get_window_by_id,
+)
 from app.config import RecorderConfig
 from app.logs import write_failure_log
 
@@ -63,6 +68,9 @@ class FFmpegRecorder:
         self._stop_requested = threading.Event()
         self._stderr_lines: List[str] = []
         self._start_time: float = 0.0
+        self._paused_total: float = 0.0
+        self._pause_started: float = 0.0
+        self.is_paused: bool = False
         self.cmd: List[str] = []
         self.log_path: str = ""
         self.on_stats_update: Optional[Callable[[RecordingStats], None]] = None
@@ -83,9 +91,9 @@ class FFmpegRecorder:
         height = 1080
 
         if target_type == "screen":
-            sw, sh = get_screen_resolution()
+            sw, sh, sx, sy = get_native_screen_geometry()
             width, height = sw, sh
-            crop_x, crop_y = 0, 0
+            crop_x, crop_y = sx, sy
         elif target_type == "window":
             # Refresh window geometry live
             win = get_window_by_id(self.config.window_id)
@@ -191,6 +199,16 @@ class FFmpegRecorder:
         else:
             cmd.extend(["-c:v", vcodec])
 
+        # Video resolution scaling filter (if non-native resolution requested)
+        res = getattr(self.config, "resolution", "native")
+        if vcodec != "copy" and res != "native":
+            if res == "1080p":
+                cmd.extend(["-vf", "scale=-2:1080"])
+            elif res == "720p":
+                cmd.extend(["-vf", "scale=-2:720"])
+            elif res == "480p":
+                cmd.extend(["-vf", "scale=-2:480"])
+
         # Bitrate override if set
         if self.config.video_bitrate.strip():
             cmd.extend(["-b:v", self.config.video_bitrate.strip()])
@@ -262,6 +280,9 @@ class FFmpegRecorder:
         self._stop_requested.clear()
         self._stderr_lines.clear()
         self._start_time = time.time()
+        self._paused_total = 0.0
+        self._pause_started = 0.0
+        self.is_paused = False
 
         try:
             self.process = subprocess.Popen(
@@ -306,7 +327,7 @@ class FFmpegRecorder:
 
                 if key == "out_time":
                     # Wall clock, not ffmpeg's out_time (which starts slightly negative)
-                    secs = max(0, int(time.time() - self._start_time))
+                    secs = max(0, int(time.time() - self._start_time - self._paused_total))
                     self.stats.elapsed_seconds = float(secs)
                     self.stats.elapsed_str = f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
                 elif key == "fps":
@@ -348,6 +369,30 @@ class FFmpegRecorder:
             if "Error" in line or "Unknown" in line or "Invalid" in line:
                 self.stats.error_message = line.strip()
 
+    def pause(self) -> bool:
+        """Suspend the FFmpeg process (SIGSTOP) to pause recording."""
+        if not self.process or self.is_paused or self.process.poll() is not None:
+            return False
+        try:
+            self.process.send_signal(signal.SIGSTOP)
+        except Exception:
+            return False
+        self.is_paused = True
+        self._pause_started = time.time()
+        return True
+
+    def resume(self) -> bool:
+        """Resume a paused FFmpeg process (SIGCONT)."""
+        if not self.process or not self.is_paused:
+            return False
+        try:
+            self.process.send_signal(signal.SIGCONT)
+        except Exception:
+            return False
+        self._paused_total += time.time() - self._pause_started
+        self.is_paused = False
+        return True
+
     def stop(self) -> RecordingResult:
         """Gracefully stop FFmpeg and finalize media container."""
         if not self.process:
@@ -362,6 +407,14 @@ class FFmpegRecorder:
         self._stop_requested.set()
         proc = self.process
         self.process = None
+
+        # A SIGSTOP'd process can't read stdin or exit cleanly - resume it first.
+        if self.is_paused:
+            try:
+                proc.send_signal(signal.SIGCONT)
+            except Exception:
+                pass
+            self.is_paused = False
 
         # Step 1: Send 'q' to stdin for clean container closure
         try:

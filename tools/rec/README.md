@@ -23,23 +23,26 @@ on GNOME, the AppIndicator extension (enabled by default on Ubuntu).
 ```
 
 - **Big button** starts/stops recording; while recording it shows elapsed time and file size.
-- **Screen** records the full display.
+- **Screen** records the display at native resolution.
 - **Window** turns the cursor into a crosshair; click the window to record.
 - **Selection** lets you drag a box on the screen (with `slop`, a single click picks a whole window).
-- **While recording** a red dot with the elapsed time shows in the system tray / GNOME top bar
-  (click it to stop), and the terminal's window title reads `● REC 00:01:23`. A desktop
-  notification pops up when the file is saved or recording fails.
-- **Advanced ›** opens a settings page: save folder, file prefix, container, codec,
-  preset, framerate, CRF, audio (none / system / mic), cursor, extra ffmpeg args.
+- **While recording** a red dot with the elapsed time and resolution shows in the system tray /
+  GNOME top bar (click it to stop, right-click for a Pause/Resume + Stop menu), and the
+  terminal's window title reads `● REC 00:01:23`. A desktop notification pops up when the
+  file is saved or recording fails.
+- **Advanced ›** opens a settings page: save folder, file prefix, container, resolution
+  (native by default, or scale to 1080p/720p/480p), codec, preset, framerate, CRF,
+  audio (none / system / mic), cursor, extra ffmpeg args.
 
-Defaults: save to `~/Videos`, `.mkv`, H.264 (`libx264`, `veryfast`, CRF 23), 30 fps, no audio.
+Defaults: save to `~/Videos`, `.mkv`, native resolution, H.264 (`libx264`, `veryfast`, CRF 23), 30 fps, no audio.
 Settings persist in `~/.config/rec/config.json`.
 
 ## Keys
 
 | Key | Action |
 |-----|--------|
-| `r` / `F9` | Record / stop |
+| `r` / `F9` | Record / stop (resume if paused) |
+| `p` | Pause / resume |
 | `1` `2` `3` | Screen / Window / Selection |
 | `a` | Advanced settings (`Esc` to go back) |
 | `o` | Open output folder |

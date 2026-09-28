@@ -36,6 +36,12 @@ Screen {
     border: heavy #e11d48;
 }
 
+#btn-record.paused {
+    background: #1a1a1e;
+    color: #f59e0b;
+    border: heavy #f59e0b;
+}
+
 #targets {
     width: 100%;
     max-width: 72;
@@ -149,6 +155,11 @@ Screen {
 #statusbar.recording {
     background: #e11d48;
     color: #ffffff;
+}
+
+#statusbar.paused {
+    background: #f59e0b;
+    color: #1a1a1e;
 }
 
 #statusbar.error {

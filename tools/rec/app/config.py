@@ -9,10 +9,17 @@ from typing import Any, Dict, List
 CONFIG_DIR = Path.home() / ".config" / "rec"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 # Bump to reset output/format settings in older saved configs to new defaults.
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 DEFAULT_OUTPUT_DIR = "~/Videos"
 
 CONTAINERS = ["mkv", "mp4", "webm", "mov", "avi", "gif"]
+
+RESOLUTIONS = [
+    ("Native (Default)", "native"),
+    ("1080p (FHD)", "1080p"),
+    ("720p (HD)", "720p"),
+    ("480p (SD)", "480p"),
+]
 
 VIDEO_CODECS = [
     ("libx264 (H.264 CPU - Standard)", "libx264"),
@@ -60,9 +67,11 @@ FPS_OPTIONS = [15, 24, 30, 60]
 class RecorderConfig:
     # Target capture options
     target_type: str = "screen"  # "screen", "window", "region"
-    screen_name: str = ":1.0"
-    screen_width: int = 1920
-    screen_height: int = 1080
+    screen_name: str = ""
+    screen_width: int = 0
+    screen_height: int = 0
+    screen_x: int = 0
+    screen_y: int = 0
 
     # Window capture
     window_id: str = ""
@@ -85,6 +94,7 @@ class RecorderConfig:
 
     # Encoding & Container (Advanced)
     container: str = "mkv"
+    resolution: str = "native"  # "native", "1080p", "720p", "480p"
     video_codec: str = "libx264"
     video_preset: str = "veryfast"
     framerate: int = 30
@@ -104,7 +114,19 @@ class RecorderConfig:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if data.get("config_version", 1) < CONFIG_VERSION:
-                    for k in ("output_dir", "filename_prefix", "container", "video_codec", "video_preset"):
+                    for k in (
+                        "output_dir",
+                        "filename_prefix",
+                        "container",
+                        "video_codec",
+                        "video_preset",
+                        "screen_name",
+                        "screen_width",
+                        "screen_height",
+                        "screen_x",
+                        "screen_y",
+                        "resolution",
+                    ):
                         data.pop(k, None)
                     data["config_version"] = CONFIG_VERSION
                 return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})

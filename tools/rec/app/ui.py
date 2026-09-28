@@ -17,12 +17,13 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
-from app.capture_targets import get_screen_resolution, pick_window_interactively
+from app.capture_targets import get_screen_resolution, get_window_by_id, pick_window_interactively
 from app.config import (
     CONTAINERS,
     CPU_PRESETS,
     FPS_OPTIONS,
     NVENC_PRESETS,
+    RESOLUTIONS,
     VIDEO_CODECS,
     RecorderConfig,
 )
@@ -65,6 +66,8 @@ class AdvancedScreen(Screen):
                 yield Input(c.filename_prefix, id="in-prefix")
                 yield Label("Container")
                 yield Select([(f".{x}", x) for x in CONTAINERS], value=c.container, id="sel-container", allow_blank=False)
+                yield Label("Resolution")
+                yield Select(RESOLUTIONS, value=c.resolution, id="sel-resolution", allow_blank=False)
                 yield Label("Video codec")
                 yield Select(VIDEO_CODECS, value=c.video_codec, id="sel-vcodec", allow_blank=False)
                 yield Label("Preset")
@@ -104,6 +107,8 @@ class AdvancedScreen(Screen):
             self.config.video_preset = default
         elif sid == "sel-preset":
             self.config.video_preset = str(val)
+        elif sid == "sel-resolution":
+            self.config.resolution = str(val)
         elif sid == "sel-fps":
             self.config.framerate = int(val)
         elif sid == "sel-audio":
@@ -146,6 +151,7 @@ class ScreenRecApp(App):
     BINDINGS = [
         Binding("r", "toggle_record", "Record/Stop"),
         Binding("f9", "toggle_record", "Record/Stop", show=False),
+        Binding("p", "toggle_pause", "Pause/Resume"),
         Binding("1", "target('screen')", "Screen"),
         Binding("2", "target('window')", "Window"),
         Binding("3", "target('region')", "Selection"),
@@ -186,12 +192,14 @@ class ScreenRecApp(App):
 
     def _set_status(self, badge: str, text: str, state: str = "idle") -> None:
         bar = self.query_one("#statusbar", Static)
-        for cls in ("idle", "recording", "error"):
+        for cls in ("idle", "recording", "paused", "error"):
             bar.set_class(cls == state, cls)
         bar.update(f"[b] {badge} [/b] {text}")
         self._set_terminal_title("rec" if badge == "IDLE" else f"{badge} {text.split(' · ')[0]} - rec")
         if state == "recording":
-            self._tray_send(f"label {text.split(' · ')[0]}")
+            res = getattr(self.config, "resolution", "native")
+            res_label = "native" if res == "native" else res
+            self._tray_send(f"label {text.split(' · ')[0]} · {res_label}")
 
     # ---- outside the terminal: window title, tray icon, desktop notifications
 
@@ -217,8 +225,11 @@ class ScreenRecApp(App):
 
         def read_clicks() -> None:
             for line in tray.stdout:
-                if line.strip() == "stop":
+                cmd = line.strip()
+                if cmd == "stop":
                     self.call_from_thread(self._stop_from_tray)
+                elif cmd == "pause":
+                    self.call_from_thread(self._toggle_pause_from_tray)
 
         threading.Thread(target=read_clicks, daemon=True).start()
 
@@ -242,6 +253,14 @@ class ScreenRecApp(App):
     def _stop_from_tray(self) -> None:
         if self.is_recording:
             self.stop_recording()
+
+    def _toggle_pause_from_tray(self) -> None:
+        if not self.is_recording:
+            return
+        if self.recorder.is_paused:
+            self.resume_recording()
+        else:
+            self.pause_recording()
 
     def _desktop_notify(self, summary: str, body: str, urgent: bool = False) -> None:
         if not shutil.which("notify-send"):
@@ -267,16 +286,24 @@ class ScreenRecApp(App):
     def _refresh_info(self) -> None:
         c = self.config
         if c.target_type == "screen":
-            w, h = get_screen_resolution()
-            what = f"Full screen {w}x{h}"
+            cap_w, cap_h = get_screen_resolution()
+            what = f"Full screen {cap_w}x{cap_h}"
         elif c.target_type == "window":
             what = f"Window: {c.window_title or c.window_id or '(none)'}"
+            win = get_window_by_id(c.window_id) if c.window_id else None
+            cap_w, cap_h = (win.width, win.height) if win else (None, None)
         else:
             what = f"Selection {c.region_width}x{c.region_height} at +{c.region_x}+{c.region_y}"
+            cap_w, cap_h = c.region_width, c.region_height
         out = os.path.expanduser(c.output_dir).replace(str(Path.home()), "~", 1)
         codec = "H.264" if c.video_codec == "libx264" else c.video_codec
+        resolution = getattr(c, "resolution", "native")
+        if resolution == "native":
+            res_tag = f" · {cap_w}x{cap_h} (native)" if cap_w and cap_h else " · Native"
+        else:
+            res_tag = f" · {resolution}"
         self.query_one("#target-info", Static).update(
-            f"{what}\n[dim]{out} · .{c.container} · {codec} · {c.framerate} fps[/dim]"
+            f"{what}\n[dim]{out} · .{c.container}{res_tag} · {codec} · {c.framerate} fps[/dim]"
         )
 
     def action_target(self, target: str) -> None:
@@ -373,9 +400,20 @@ class ScreenRecApp(App):
 
     def action_toggle_record(self) -> None:
         if self.is_recording:
-            self.stop_recording()
+            if self.recorder.is_paused:
+                self.resume_recording()
+            else:
+                self.stop_recording()
         else:
             self.start_recording()
+
+    def action_toggle_pause(self) -> None:
+        if not self.is_recording:
+            return
+        if self.recorder.is_paused:
+            self.resume_recording()
+        else:
+            self.pause_recording()
 
     def action_handle_escape(self) -> None:
         if self.is_recording:
@@ -427,6 +465,7 @@ class ScreenRecApp(App):
         btn = self.query_one("#btn-record", Button)
         btn.label = "● REC"
         btn.remove_class("recording")
+        btn.remove_class("paused")
         self.query_one("#targets").disabled = False
         self.query_one("#btn-advanced").disabled = False
         if res.success:
@@ -436,6 +475,26 @@ class ScreenRecApp(App):
             self._desktop_notify("rec: recording saved", f"{name}\n{res.duration_str} · {res.size_str}")
         else:
             self._fail("Recording failed", res.error or "", res.log_path)
+
+    def pause_recording(self) -> None:
+        if not self.is_recording or not self.recorder.pause():
+            return
+        btn = self.query_one("#btn-record", Button)
+        btn.label = "▶ RESUME  " + self.recorder.stats.elapsed_str
+        btn.remove_class("recording")
+        btn.add_class("paused")
+        self._set_status("PAUSED", f"{self.recorder.stats.elapsed_str} · {Path(self.recorder.stats.file_path).name}", "paused")
+        self._tray_send("paused true")
+
+    def resume_recording(self) -> None:
+        if not self.is_recording or not self.recorder.resume():
+            return
+        btn = self.query_one("#btn-record", Button)
+        btn.label = "■ STOP  " + self.recorder.stats.elapsed_str
+        btn.remove_class("paused")
+        btn.add_class("recording")
+        self._set_status("● REC", f"{self.recorder.stats.elapsed_str} · {Path(self.recorder.stats.file_path).name}", "recording")
+        self._tray_send("paused false")
 
     def _watch_ffmpeg(self) -> None:
         """ffmpeg exiting on its own (bad geometry, missing device…) ends the recording."""

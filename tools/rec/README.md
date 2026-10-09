@@ -18,7 +18,7 @@ on GNOME, the AppIndicator extension (enabled by default on Ubuntu).
 └──────────────────────────────────────┘
  [ Screen ]   [ Window ]   [ Selection ]
       Full screen 1920x1080
-   ~/Videos · .mkv · H.264 · 30 fps
+   ~/Videos · .mp4 · NVENC H.264 (HW) · 30 fps
       Open folder   Advanced ›
 ```
 
@@ -34,7 +34,7 @@ on GNOME, the AppIndicator extension (enabled by default on Ubuntu).
   (native by default, or scale to 1080p/720p/480p), codec, preset, framerate, CRF,
   audio (none / system / mic), cursor, extra ffmpeg args.
 
-Defaults: save to `~/Videos`, `.mkv`, native resolution, H.264 (`libx264`, `veryfast`, CRF 23), 30 fps, no audio.
+Defaults: save to `~/Videos`, `.mp4` (WhatsApp native), native resolution, auto HW accelerated encoder (`h264_nvenc` if supported, fallback to `libx264`), 30 fps, no audio.
 Settings persist in `~/.config/rec/config.json`.
 
 ## Keys
@@ -58,6 +58,7 @@ main.py               entrypoint
 app/ui.py             TUI (main screen + Advanced screen)
 app/styles.tcss       styles
 app/recorder.py       ffmpeg command builder / process control
+app/hw_accel.py       hardware acceleration probing and selection
 app/capture_targets.py screen size, window picking
 app/region_selector.py Tkinter drag-to-select overlay
 app/tray.py           tray icon (StatusNotifierItem over D-Bus, PyGObject only)

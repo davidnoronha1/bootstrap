@@ -9,10 +9,10 @@ from typing import Any, Dict, List
 CONFIG_DIR = Path.home() / ".config" / "rec"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 # Bump to reset output/format settings in older saved configs to new defaults.
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 DEFAULT_OUTPUT_DIR = "~/Videos"
 
-CONTAINERS = ["mkv", "mp4", "webm", "mov", "avi", "gif"]
+CONTAINERS = ["mp4", "mkv", "webm", "mov", "avi", "gif"]
 
 RESOLUTIONS = [
     ("Native (Default)", "native"),
@@ -22,10 +22,11 @@ RESOLUTIONS = [
 ]
 
 VIDEO_CODECS = [
-    ("libx264 (H.264 CPU - Standard)", "libx264"),
+    ("Auto (Hardware if supported)", "auto"),
     ("h264_nvenc (NVIDIA NVENC H.264)", "h264_nvenc"),
-    ("libx265 (HEVC CPU - High Compression)", "libx265"),
+    ("libx264 (H.264 CPU - Standard)", "libx264"),
     ("hevc_nvenc (NVIDIA NVENC HEVC)", "hevc_nvenc"),
+    ("libx265 (HEVC CPU - High Compression)", "libx265"),
     ("libvpx-vp9 (VP9 - WebM)", "libvpx-vp9"),
     ("copy (Stream Copy)", "copy"),
 ]
@@ -93,10 +94,10 @@ class RecorderConfig:
     filename_prefix: str = "recording"
 
     # Encoding & Container (Advanced)
-    container: str = "mkv"
+    container: str = "mp4"
     resolution: str = "native"  # "native", "1080p", "720p", "480p"
-    video_codec: str = "libx264"
-    video_preset: str = "veryfast"
+    video_codec: str = "auto"
+    video_preset: str = "p4"
     framerate: int = 30
     crf: int = 23
     video_bitrate: str = ""  # e.g., "4000k"

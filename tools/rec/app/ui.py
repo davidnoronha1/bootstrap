@@ -17,7 +17,12 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
-from app.capture_targets import get_screen_resolution, get_window_by_id, pick_window_interactively
+from app.capture_targets import (
+    get_native_screen_geometry,
+    get_screen_resolution,
+    get_window_by_id,
+    pick_window_interactively,
+)
 from app.config import (
     CONTAINERS,
     CPU_PRESETS,
@@ -27,6 +32,7 @@ from app.config import (
     VIDEO_CODECS,
     RecorderConfig,
 )
+from app.hw_accel import get_encoder_display_label, resolve_video_codec
 from app.logs import write_failure_log
 from app.recorder import FFmpegRecorder, RecordingResult, RecordingStats
 
@@ -34,6 +40,12 @@ TARGET_LABELS = {"screen": "Screen", "window": "Window", "region": "Selection"}
 
 
 def _preset_options(codec: str):
+    if codec == "auto":
+        sw, sh, _, _ = get_native_screen_geometry()
+        eff_codec, _ = resolve_video_codec("auto", sw, sh)
+        if "nvenc" in eff_codec:
+            return [(p, p.split()[0]) for p in NVENC_PRESETS]
+        return [(p, p) for p in CPU_PRESETS]
     if "nvenc" in codec:
         return [(p, p.split()[0]) for p in NVENC_PRESETS]
     return [(p, p) for p in CPU_PRESETS]
@@ -100,7 +112,12 @@ class AdvancedScreen(Screen):
         elif sid == "sel-vcodec":
             self.config.video_codec = str(val)
             opts = _preset_options(str(val))
-            default = "p4" if "nvenc" in str(val) else "veryfast"
+            if str(val) == "auto":
+                sw, sh, _, _ = get_native_screen_geometry()
+                eff_codec, _ = resolve_video_codec("auto", sw, sh)
+                default = "p4" if "nvenc" in eff_codec else "veryfast"
+            else:
+                default = "p4" if "nvenc" in str(val) else "veryfast"
             preset = self.query_one("#sel-preset", Select)
             preset.set_options(opts)
             preset.value = default
@@ -296,14 +313,21 @@ class ScreenRecApp(App):
             what = f"Selection {c.region_width}x{c.region_height} at +{c.region_x}+{c.region_y}"
             cap_w, cap_h = c.region_width, c.region_height
         out = os.path.expanduser(c.output_dir).replace(str(Path.home()), "~", 1)
-        codec = "H.264" if c.video_codec == "libx264" else c.video_codec
         resolution = getattr(c, "resolution", "native")
         if resolution == "native":
             res_tag = f" · {cap_w}x{cap_h} (native)" if cap_w and cap_h else " · Native"
         else:
             res_tag = f" · {resolution}"
+
+        # Resolve effective encoder & hardware acceleration for target resolution
+        probe_w = cap_w or 1920
+        probe_h = cap_h or 1080
+        eff_codec, is_hw = resolve_video_codec(c.video_codec, probe_w, probe_h)
+        encoder_label = get_encoder_display_label(eff_codec, is_hw)
+        hw_badge = f"[bold green]{encoder_label}[/bold green]" if is_hw else f"[dim]{encoder_label}[/dim]"
+
         self.query_one("#target-info", Static).update(
-            f"{what}\n[dim]{out} · .{c.container}{res_tag} · {codec} · {c.framerate} fps[/dim]"
+            f"{what}\n[dim]{out} · .{c.container}{res_tag} · [/dim]{hw_badge}[dim] · {c.framerate} fps[/dim]"
         )
 
     def action_target(self, target: str) -> None:

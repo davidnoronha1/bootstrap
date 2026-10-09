@@ -18,7 +18,8 @@ from app.capture_targets import (
     get_screen_resolution,
     get_window_by_id,
 )
-from app.config import RecorderConfig
+from app.config import CPU_PRESETS, RecorderConfig
+from app.hw_accel import resolve_video_codec
 from app.logs import write_failure_log
 
 
@@ -152,14 +153,17 @@ class FFmpegRecorder:
             ])
 
         # Video encoding parameters
-        vcodec = self.config.video_codec
+        vcodec, is_hw = resolve_video_codec(self.config.video_codec, width, height)
+        self.effective_vcodec = vcodec
+        self.is_hw = is_hw
         preset = self.config.video_preset
         crf = str(self.config.crf)
 
         if vcodec == "libx264":
+            cpu_preset = preset if preset in CPU_PRESETS else "veryfast"
             cmd.extend([
                 "-c:v", "libx264",
-                "-preset", preset,
+                "-preset", cpu_preset,
                 "-crf", crf,
                 "-pix_fmt", "yuv420p",
             ])
@@ -173,9 +177,10 @@ class FFmpegRecorder:
                 "-pix_fmt", "yuv420p",
             ])
         elif vcodec == "libx265":
+            cpu_preset = preset if preset in CPU_PRESETS else "veryfast"
             cmd.extend([
                 "-c:v", "libx265",
-                "-preset", preset,
+                "-preset", cpu_preset,
                 "-crf", crf,
                 "-pix_fmt", "yuv420p",
             ])

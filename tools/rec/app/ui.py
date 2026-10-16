@@ -161,6 +161,12 @@ class AdvancedScreen(Screen):
         self.app.pop_screen()
 
 
+def _system_python() -> str:
+    """Interpreter for the tray/region helpers: they need the distro's PyGObject and
+    tkinter, which the isolated uv environment doesn't have."""
+    return shutil.which("python3", path="/usr/bin:/usr/local/bin") or sys.executable
+
+
 class ScreenRecApp(App):
     CSS_PATH = "styles.tcss"
     TITLE = "ScreenRec"
@@ -228,7 +234,7 @@ class ScreenRecApp(App):
     def _tray_start(self) -> None:
         try:
             self._tray = subprocess.Popen(
-                [sys.executable, str(Path(__file__).parent / "tray.py")],
+                [_system_python(), str(Path(__file__).parent / "tray.py")],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -396,7 +402,7 @@ class ScreenRecApp(App):
     def _select_with_overlay():
         """Fallback when slop isn't installed: Tk overlay over a desktop screenshot."""
         picker = Path(__file__).parent / "region_selector.py"
-        proc = subprocess.run([sys.executable, str(picker)], capture_output=True, text=True, timeout=300)
+        proc = subprocess.run([_system_python(), str(picker)], capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:
             raise RuntimeError(f"selector exited {proc.returncode}\n\n--- selector stderr ---\n{proc.stderr}")
         res = json.loads(proc.stdout.strip() or "{}")

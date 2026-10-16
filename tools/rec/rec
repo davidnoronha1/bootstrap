@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for rec. Resolves symlinks (e.g. ~/.local/bin/rec) and prefers the
-# bundled venv that bootstrap.sh creates, falling back to the system python.
+# Launcher for rec. Resolves symlinks (e.g. ~/.local/bin/rec) and runs main.py
+# in uv script mode (dependencies come from main.py's inline metadata).
 DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-PY="$DIR/.venv/bin/python3"
-[[ -x "$PY" ]] || PY=python3
-exec "$PY" "$DIR/main.py" "$@"
+exec uv run --script "$DIR/main.py" "$@"

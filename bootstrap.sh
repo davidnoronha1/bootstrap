@@ -2510,7 +2510,7 @@ step_scpt() {
 # ----------------------------------------------------------------------------
 _rec_deps() { # system packages rec needs, per package manager
     case "$PM" in
-        apt)     printf '%s\n' x11-utils python3-tk python3-gi python3-venv slop libnotify-bin ;;
+        apt)     printf '%s\n' x11-utils python3-tk python3-gi slop libnotify-bin ;;
         dnf|yum) printf '%s\n' xorg-x11-utils python3-tkinter python3-gobject slop libnotify ;;
         pacman)  printf '%s\n' xorg-xwininfo tk python-gobject slop libnotify ;;
         zypper)  printf '%s\n' xwininfo python3-tk python3-gobject slop libnotify-tools ;;
@@ -2547,21 +2547,14 @@ _install_rec() {
     ensure_user_dirs
     local g dest="$TARGET_HOME/.local/share/rec"
     g="$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")"
-    # Replace the code but keep an existing venv (faster reinstalls)
     asroot install -d -o "$TARGET_USER" -g "$g" -m 0755 "$dest" || return 1
-    asroot find "$dest" -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} + || return 1
+    asroot find "$dest" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || return 1
     tar -C "$found" --exclude=__pycache__ --exclude=.venv -cf - . | asroot tar -xf - -C "$dest" || return 1
     asroot chown -R "$TARGET_USER:$g" "$dest" || return 1
     asroot chmod 0755 "$dest/rec" || return 1
 
-    # venv with system site-packages so PyGObject (tray) and tkinter come from the distro
-    if ! run_user "$TARGET_USER" bash -c "
-        set -e
-        [[ -x '$dest/.venv/bin/python3' ]] || python3 -m venv --system-site-packages '$dest/.venv'
-        '$dest/.venv/bin/python3' -m pip install -q --upgrade -r '$dest/requirements.txt'
-    "; then
-        err "failed to set up rec's python venv in $dest/.venv"
-        return 1
+    if ! user_cmd_exists uv; then
+        warn "uv not found; rec runs via 'uv run --script' (see the uv step)"
     fi
 
     run_user "$TARGET_USER" ln -sf "$dest/rec" "$TARGET_HOME/.local/bin/rec" || return 1

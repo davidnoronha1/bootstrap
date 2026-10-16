@@ -1,9 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "textual>=8.0.0",
+#     "rich>=13.0.0",
+# ]
+# ///
 """ScreenRec Studio - FFmpeg Screen, Window & Region Recorder TUI.
 
 Usage:
-    python3 main.py           # Launch interactive TUI
-    ./rec                     # Run executable launcher
+    ./main.py                 # uv script mode (deps resolved from the header)
+    ./rec                     # Same, via the launcher
 """
 
 import sys

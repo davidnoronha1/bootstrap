@@ -1,12 +1,12 @@
 # rec
 
-A minimal FFmpeg screen recorder TUI (Textual, X11).
+A minimal FFmpeg screen recorder TUI (Textual, X11), run as a [uv](https://docs.astral.sh/uv/) script.
 
 ```bash
-./rec            # or: python3 main.py
+./rec            # or: ./main.py  (uv resolves textual+rich from the script header)
 ```
 
-Requires Python 3.10+, `ffmpeg` (x11grab + libx264), `xwininfo`, `pip install -r requirements.txt`.
+Requires `uv`, `ffmpeg` (x11grab + libx264), `xwininfo`.
 Selection uses `slop` (`sudo apt install slop`) and falls back to a Tkinter overlay (`python3-tk`); the tray icon uses PyGObject (`python3-gi`) and,
 on GNOME, the AppIndicator extension (enabled by default on Ubuntu).
 
@@ -54,7 +54,7 @@ Failures (ffmpeg, window pick, selection) write a log to `~/.local/state/rec/log
 
 ```
 rec                   launcher
-main.py               entrypoint
+main.py               entrypoint (PEP 723 script header lists deps)
 app/ui.py             TUI (main screen + Advanced screen)
 app/styles.tcss       styles
 app/recorder.py       ffmpeg command builder / process control

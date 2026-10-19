@@ -45,12 +45,15 @@ SKIP_SCPT=0
 SKIP_REC=0
 USER_FLAG=""
 RESULTS=()
+FAILED_STEPS=0
+OFFLINE=0   # set when DNS/internet or curl is unavailable; download steps are skipped
 STEPS_TOTAL=14
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 INSTALLED_LOG="$HOME/.local/var/bootstrap-managed.txt"
 
 # Run-tracking, used only to offer an opt-in undo if the run is interrupted.
 # Installed packages/tools are NEVER auto-removed, no matter what.
+TEMP_ROOT=""
 TEMP_PATHS=()
 CREATED_FILES=()
 BACKED_UP_FILES=()
@@ -59,11 +62,13 @@ SSH_KEY_CREATED=0
 SSH_KEY_PATH=""
 WRITTEN_RC=""
 SPINNER_PID=""
+SUDO_KEEPALIVE_PID=""
 
 ID="" ID_LIKE="" VERSION_ID="" CODENAME="" PRETTY_NAME=""
 ARCH="$(uname -m)"
 PM="none"
 SCRIPT_DIR=""
+SCRIPT_FILE=""
 FILES_DIR=""
 DEFAULT_USER=""
 TARGET_USER=""
@@ -72,6 +77,8 @@ TARGET_HOME=""
 # ----------------------------------------------------------------------------
 #  TUI helpers
 # ----------------------------------------------------------------------------
+C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_ORANGE="" C_GRAY=""
+
 init_colors() {
     if [[ -t 1 && -z "${NO_COLOR:-}" && $TUI_OFF -eq 0 ]]; then
         C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
@@ -90,16 +97,30 @@ err()  { printf '%s %s\n' "${C_RED}✗${C_RESET}" "$*" >&2; }
 # ----------------------------------------------------------------------------
 #  Temp-file tracking / cleanup (always runs, on normal exit or interrupt)
 # ----------------------------------------------------------------------------
-new_tmp() { local t; t="$(mktemp)"; TEMP_PATHS+=("$t"); printf '%s' "$t"; }
-new_tmpdir() { local t; t="$(mktemp -d)"; TEMP_PATHS+=("$t"); printf '%s' "$t"; }
+init_tmp() {
+    TEMP_ROOT="$(mktemp -d /tmp/bootstrap.XXXXXXXX)" || return 1
+    # A switched target user can traverse to a scratch directory we chown to it,
+    # without being able to list the other temporary files (each is private).
+    chmod 0711 "$TEMP_ROOT" || return 1
+}
+
+# Command substitutions and spinner jobs run in subshells. Put their files in
+# one shared directory so the main process can clean them up on exit too.
+new_tmp() { mktemp "${TEMP_ROOT:?temporary directory not initialized}/file.XXXXXXXX"; }
+new_tmpdir() { mktemp -d "${TEMP_ROOT:?temporary directory not initialized}/dir.XXXXXXXX"; }
 register_tmp() { TEMP_PATHS+=("$1"); }
+
+# `hostname` isn't installed on every minimal image (Arch, Fedora containers).
+host_name() { hostname 2>/dev/null || uname -n; }
 
 cleanup_tmp() {
     local p
-    for p in "${TEMP_PATHS[@]:-}"; do
-        [[ -n "$p" && -e "$p" ]] && rm -rf "$p"
+    for p in "${TEMP_PATHS[@]}"; do
+        [[ -n "$p" && -e "$p" ]] && rm -rf -- "$p"
     done
+    [[ -z "$TEMP_ROOT" ]] || rm -rf -- "$TEMP_ROOT"
     TEMP_PATHS=()
+    TEMP_ROOT=""
 }
 
 register_managed() { # register_managed NAME METHOD [PATH]
@@ -130,7 +151,8 @@ manage_remove() { # manage_remove TOOL
     [[ ! -f "$INSTALLED_LOG" ]] && { err "no managed tools found"; return 1; }
 
     local entry name method path found=0 pm
-    local tmp="$(new_tmp)"
+    local tmp
+    tmp="$(new_tmp)" || return 1
     while IFS='|' read -r name method path; do
         [[ -z "$name" ]] && continue
         if [[ "$name" == "$target" ]]; then
@@ -203,7 +225,7 @@ manage_tui() {
         local sel="${REPLY:-}"
         [[ -z "$sel" || "$sel" == "q" || "$sel" == "Q" ]] && return 0
 
-        local targets=() tok idx
+        local targets=() tok
         if [[ "$sel" == "a" || "$sel" == "A" ]]; then
             targets=("${MT_NAMES[@]}")
         else
@@ -382,7 +404,7 @@ spinner() {
         bar="$(render_bar "$done" "$STEPS_TOTAL" 14)"
         suffix=" ${C_ORANGE}${bar}${C_RESET}"
         local log pid rc i
-        log="$(new_tmp)"
+        log="$(new_tmp)" || return 1
         "$@" </dev/null >"$log" 2>&1 & pid=$!
         SPINNER_PID=$pid
         i=0
@@ -408,11 +430,11 @@ spinner() {
 }
 
 install() { # install LABEL CMD...
-    local label="$1" cmd status
+    local label="$1"
     shift
     if [[ -t 1 && $TUI_OFF -eq 0 ]]; then
         printf '%s installing %s%s\n' "$C_DIM" "$label" "$C_RESET"
-        printf '%s $ %s\n' "$C_GRAY" "$(printf '%q ' "$@")" "$C_RESET" >&2
+        printf '%s $ %s%s\n' "$C_GRAY" "$(printf '%q ' "$@")" "$C_RESET" >&2
     else
         printf '%s\n' "installing $label"
     fi
@@ -436,20 +458,48 @@ run_step() {
         RESULTS+=("${C_GREEN}✓${C_RESET} $title")
     else
         rc=1
+        FAILED_STEPS=$((FAILED_STEPS + 1))
         RESULTS+=("${C_RED}✗${C_RESET} $title")
     fi
     return "$rc"
 }
 
-skip_step() {
-    local title="$1"
-    RESULTS+=("${C_DIM}○${C_RESET} $title (skipped)")
-    printf '\n%s[%s/%s] %s\n' "$C_ORANGE" "${#RESULTS[@]}" "$STEPS_TOTAL" "$C_DIM$title - skipped$C_RESET"
+skip_step() { # skip_step TITLE [REASON]
+    local title="$1" why="${2:-skipped}"
+    RESULTS+=("${C_DIM}○${C_RESET} $title ($why)")
+    printf '\n%s[%s/%s] %s\n' "$C_ORANGE" "${#RESULTS[@]}" "$STEPS_TOTAL" "$C_DIM$title - $why$C_RESET"
+}
+
+maybe_step() { # maybe_step SKIP_FLAG local|net TITLE FN
+    local skip="$1" needs="$2" title="$3" fn="$4"
+    if [[ "$skip" -eq 1 ]]; then skip_step "$title"
+    elif [[ "$needs" == net && $OFFLINE -eq 1 ]]; then skip_step "$title" "skipped: offline"
+    else run_step "$title" "$fn"
+    fi
 }
 
 # ----------------------------------------------------------------------------
 #  System helpers
 # ----------------------------------------------------------------------------
+# Authenticate sudo once up front and keep the timestamp fresh. Otherwise a
+# long run (common on remote hosts) hits a password prompt mid-spinner, where
+# the spinner redraw hides it and the step looks hung.
+start_sudo_keepalive() {
+    [[ $EUID -eq 0 ]] && return 0
+    if ! sudo -n true 2>/dev/null; then
+        info "sudo access is needed; you may be asked for your password once"
+        sudo -v || return 1
+    fi
+    ( while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) >/dev/null 2>&1 &
+    SUDO_KEEPALIVE_PID=$!
+}
+
+stop_sudo_keepalive() {
+    [[ -n "$SUDO_KEEPALIVE_PID" ]] || return 0
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=""
+}
+
 asroot() {
     # `command` so e.g. `asroot install ...` runs /usr/bin/install, not our install() helper
     if [[ $EUID -eq 0 ]]; then command "$@"
@@ -569,22 +619,22 @@ subst_template() { # subst_template TEMPLATE VAR...
 }
 
 _write_file() { # _write_file DEST FUNC
-    local dest="$1" srcfn="$2" tmp
-    tmp="$(new_tmp)"
+    local dest="$1" srcfn="$2" mode="${3:-0644}" tmp
+    tmp="$(new_tmp)" || return 1
     if ! "$srcfn" > "$tmp"; then
         err "failed to generate content for $dest"
         rm -f "$tmp"
         return 1
     fi
     if [[ -e "$dest" ]]; then
-        local bak; bak="$(new_tmp)"
+        local bak; bak="$(new_tmp)" || return 1
         if cp "$dest" "$bak" 2>/dev/null || asroot cp "$dest" "$bak" 2>/dev/null; then
             BACKED_UP_FILES+=("$dest:$bak")
         fi
     else
         CREATED_FILES+=("$dest")
     fi
-    asroot install -D -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$dest"
+    asroot install -D -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m "$mode" "$tmp" "$dest" || return 1
     rm -f "$tmp"
     ok "wrote $dest"
 }
@@ -644,9 +694,66 @@ gpu_status() {
 }
 
 # ----------------------------------------------------------------------------
+#  Connectivity: almost every step downloads something, so diagnose a broken
+#  network once up front instead of failing every step with raw curl/apt/gpg
+#  errors.
+# ----------------------------------------------------------------------------
+check_network() {
+    local host=github.com ns
+    if command -v getent >/dev/null 2>&1 && ! getent ahosts "$host" >/dev/null 2>&1; then
+        err "DNS lookups are failing on this machine (can't resolve $host)"
+        ns="$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)"
+        info "  nameservers in /etc/resolv.conf: ${ns:-none}"
+        if command -v ip >/dev/null 2>&1 && [[ -z "$(ip route show default 2>/dev/null)" ]]; then
+            info "  there is no default route either; check the network cable/interface"
+        fi
+        info "  check with: resolvectl status   (or fix DNS in the Network step)"
+        return 1
+    fi
+    if command -v curl >/dev/null 2>&1 && ! curl -fsS -m 15 -o /dev/null "https://$host" 2>/dev/null; then
+        err "can't reach https://$host (no internet, or a proxy/firewall is blocking it)"
+        return 1
+    fi
+    return 0
+}
+
+ensure_download_tools() {
+    ensure_pkg_ask curl curl "needed for downloads"
+    ensure_pkg_ask gpg gnupg "needed for repo signing keys"
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is not available, so nothing can be downloaded"
+        return 1
+    fi
+}
+
+# Download a repo signing key to a file first, so a failed download reports
+# the URL instead of feeding gpg empty input ("no valid OpenPGP data found").
+fetch_key() { # fetch_key URL KEYRING
+    local url="$1" keyring="$2" tmp
+    command -v gpg >/dev/null 2>&1 || { err "gpg is not installed; can't import $url"; return 1; }
+    tmp="$(new_tmp)" || return 1
+    if ! curl -fsSL --retry 2 "$url" -o "$tmp" || [[ ! -s "$tmp" ]]; then
+        err "could not download signing key: $url"
+        return 1
+    fi
+    asroot gpg --dearmor --yes -o "$keyring" < "$tmp"
+}
+
+go_offline() { # go_offline -> 0 to continue without downloads, 1 to abort
+    warn "without network access only the user, network, dotfiles and scpt steps can run"
+    if confirm "Continue with just those steps?" n; then
+        OFFLINE=1
+        return 0
+    fi
+    return 1
+}
+
+# ----------------------------------------------------------------------------
 #  Step: preflight
 # ----------------------------------------------------------------------------
 step_preflight() {
+    # /etc/os-release sets VERSION too; keep it from overwriting ours.
+    local VERSION
     if [[ -f /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
@@ -670,9 +777,13 @@ step_preflight() {
         err "This script needs root (directly or via sudo)."
         return 1
     fi
+    start_sudo_keepalive || { err "sudo authentication failed"; return 1; }
 
-    ensure_pkg_ask curl curl "needed for downloads"
-    ensure_pkg_ask gpg gnupg "needed for repo signing keys"
+    # Check before installing curl: with no DNS, apt only adds a wall of
+    # fetch errors and the install fails anyway.
+    if ! check_network || ! ensure_download_tools; then
+        go_offline || return 1
+    fi
 
     gpu_status
     return 0
@@ -701,7 +812,7 @@ _apply_netplan_static() {
     local file="/etc/netplan/99-bootstrap-static.yaml"
     local dns_csv tmp
     dns_csv="$(printf '%s' "$dns" | tr -s ' ' ',')"
-    tmp="$(new_tmp)"
+    tmp="$(new_tmp)" || return 1
     {
         printf 'network:\n'
         printf '  version: 2\n'
@@ -763,6 +874,9 @@ step_network() {
         return 0
     fi
     warn "Misconfiguring this can drop your network/SSH connection."
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        warn "You are connected over SSH: if the address changes, this session (and the rest of the run) will be cut off."
+    fi
     if ! confirm "Are you SURE you want to continue?" n; then
         info "static IP setup cancelled"
         return 0
@@ -861,7 +975,7 @@ step_user() {
 # ----------------------------------------------------------------------------
 _docker_apt_repo() {
     asroot install -m 0755 -d /etc/apt/keyrings || return 1
-    curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | asroot gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg || return 1
+    fetch_key "https://download.docker.com/linux/${ID}/gpg" /etc/apt/keyrings/docker.gpg || return 1
     asroot chmod a+r /etc/apt/keyrings/docker.gpg 2>/dev/null || true
     local arch dist
     arch="$(dpkg --print-architecture 2>/dev/null || echo "$ARCH")"
@@ -929,7 +1043,7 @@ EOF
             ver="$(curl -fsSL https://api.github.com/repos/docker/docker-credential-helpers/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
             arch="amd64"; [[ "$ARCH" == arm64 ]] && arch="arm64"
             if [[ -n "$ver" ]]; then
-                tmpdir="$(new_tmpdir)"
+                tmpdir="$(new_tmpdir)" || return 1
                 if curl -fSL --retry 2 -# -o "$tmpdir/docker-credential-pass" \
                     "https://github.com/docker/docker-credential-helpers/releases/download/v${ver}/docker-credential-pass-v${ver}.linux-${arch}"; then
                     asroot install -m 0755 "$tmpdir/docker-credential-pass" /usr/local/bin/docker-credential-pass
@@ -946,7 +1060,7 @@ EOF
 
     asroot install -d -m 0755 -o "$TARGET_USER" -g "$g" "$TARGET_HOME/.docker"
     local tmp
-    tmp="$(new_tmp)"
+    tmp="$(new_tmp)" || return 1
     if [[ -f "$dcfg" ]]; then
         jq '.credsStore = "pass"' "$dcfg" > "$tmp" 2>/dev/null || cp "$dcfg" "$tmp"
     else
@@ -1029,8 +1143,8 @@ step_nvidia() {
         apt)
             local dist="$ID$VERSION_ID"
             asroot install -m 0755 -d /usr/share/keyrings
-            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-                | asroot gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg || return 1
+            fetch_key https://nvidia.github.io/libnvidia-container/gpgkey \
+                /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg || return 1
             curl -fsSL "https://nvidia.github.io/libnvidia-container/${dist}/libnvidia-container.list" \
                 | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
                 | asroot tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null || return 1
@@ -1068,7 +1182,7 @@ _install_ghostty() {
         local i
         for i in $(seq 1 30); do snap version >/dev/null 2>&1 && break; sleep 1; done
     fi
-    asroot snap install ghostty --classic
+    asroot snap install ghostty --classic || return 1
     register_managed "ghostty" "snap"
 }
 
@@ -1132,7 +1246,7 @@ _install_gh() {
             local ver tmp
             ver="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
             [[ -n "$ver" ]] || return 1
-            tmp="$(new_tmp)"
+            tmp="$(new_tmp)" || return 1
             printf '%s\n' "downloading gh v${ver}..."
             curl -fSL --retry 2 -# -o "$tmp" "https://github.com/cli/cli/releases/download/v${ver}/gh_${ver}_linux_${ARCH}.tar.gz" || return 1
             asroot tar -xzf "$tmp" -C /usr/local --strip-components=1
@@ -1176,13 +1290,13 @@ _install_zoxide() {
     command -v zoxide >/dev/null 2>&1 && return 0
     if _pm_install zoxide 2>/dev/null && command -v zoxide >/dev/null 2>&1; then return 0; fi
     printf '%s installing zoxide from upstream...%s\n' "$C_DIM" "$C_RESET"
-    run_user "$TARGET_USER" bash -c 'curl -fSL --retry 2 -# https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash'
+    run_user "$TARGET_USER" bash -o pipefail -c 'curl -fSL --retry 2 -# https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash'
 }
 
 write_rc_file() { # write_rc_file HOME RC_FILE NAME  (e.g. write_rc_file /home/bob .zshrc zshrc)
     local home="$1" rcfile="$2" name="$3" tmp dest
     dest="$home/$rcfile"
-    tmp="$(new_tmp)"
+    tmp="$(new_tmp)" || return 1
     if ! read_file "$name" > "$tmp"; then
         rm -f "$tmp"
         return 1
@@ -1195,7 +1309,7 @@ write_rc_file() { # write_rc_file HOME RC_FILE NAME  (e.g. write_rc_file /home/b
     else
         CREATED_FILES+=("$dest")
     fi
-    asroot install -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$dest"
+    asroot install -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$dest" || return 1
     rm -f "$tmp"
     WRITTEN_RC="$rcfile"
     ok "wrote $dest"
@@ -1269,7 +1383,7 @@ step_tools() {
         if user_cmd_exists claude; then ok "claude code already installed"
         else
             info "installing Claude Code (native binary)"
-            if run_user "$TARGET_USER" bash -c 'curl -fsSL https://claude.ai/install.sh | bash'; then
+            if run_user "$TARGET_USER" bash -o pipefail -c 'curl -fsSL https://claude.ai/install.sh | bash'; then
                 ok "claude code installed"
             else
                 warn "claude code install failed"
@@ -1281,7 +1395,7 @@ step_tools() {
         if user_cmd_exists opencode; then ok "opencode already installed"
         else
             info "installing opencode"
-            if run_user "$TARGET_USER" bash -c 'curl -fsSL https://opencode.ai/install | bash'; then
+            if run_user "$TARGET_USER" bash -o pipefail -c 'curl -fsSL https://opencode.ai/install | bash'; then
                 ok "opencode installed"
             else
                 warn "opencode install failed"
@@ -1327,7 +1441,7 @@ _install_neovim() {
     local narch="x86_64" tmp url dir
     [[ "$ARCH" == arm64 ]] && narch="arm64"
     url="https://github.com/neovim/neovim/releases/latest/download/nvim-linux-${narch}.tar.gz"
-    tmp="$(new_tmpdir)"
+    tmp="$(new_tmpdir)" || return 1
     printf '%s\n' "downloading neovim (linux-${narch})..."
     if curl -fSL --retry 2 -# "$url" -o "$tmp/nvim.tar.gz"; then
         asroot tar -xzf "$tmp/nvim.tar.gz" -C /opt 2>/dev/null || return 1
@@ -1393,7 +1507,7 @@ step_neovim() {
             ok "neovim installed: $(nvim --version 2>/dev/null | head -1)"
         else
             warn "neovim install failed"
-            return 0
+            return 1
         fi
     else
         return 0
@@ -1402,6 +1516,7 @@ step_neovim() {
     if confirm "Install LazyVim (Neovim config distribution)?" y; then
         if ! _install_lazyvim; then
             warn "LazyVim setup failed; see messages above"
+            return 1
         fi
     fi
     return 0
@@ -1425,22 +1540,25 @@ _install_node() {
             local nvmver
             nvmver="$(curl -fsSL https://api.github.com/repos/nvm-sh/nvm/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
             [[ -n "$nvmver" ]] || return 1
-            run_user "$TARGET_USER" bash -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v${nvmver}/install.sh | bash" || return 1
+            run_user "$TARGET_USER" bash -o pipefail -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v${nvmver}/install.sh | bash" || return 1
             run_user "$TARGET_USER" bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install --lts >/dev/null'
             ;;
     esac
 }
 
 _install_dotnet() { # always latest LTS via the official script (no pinned versions)
-    register_tmp "/tmp/dotnet-install.sh"
-    run_user "$TARGET_USER" bash -c \
-        'curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && bash /tmp/dotnet-install.sh --channel LTS && rm -f /tmp/dotnet-install.sh'
+    run_user "$TARGET_USER" bash -c '
+        tmp="$(mktemp -d /tmp/bootstrap-dotnet.XXXXXXXX)" || exit 1
+        trap "rm -rf -- \"\$tmp\"" EXIT
+        curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$tmp/install.sh" &&
+            bash "$tmp/install.sh" --channel LTS
+    '
 }
 
 step_toolchains() {
     if confirm "Install bun (JavaScript runtime)?" n; then
         if user_cmd_exists bun; then ok "bun already installed"
-        elif run_user "$TARGET_USER" bash -c 'curl -fsSL https://bun.sh/install | bash'; then ok "bun installed"
+        elif run_user "$TARGET_USER" bash -o pipefail -c 'curl -fsSL https://bun.sh/install | bash'; then ok "bun installed"
         else warn "bun install failed"; fi
     fi
 
@@ -1452,7 +1570,7 @@ step_toolchains() {
 
     if confirm "Install Rust (rustup)?" n; then
         if user_cmd_exists cargo; then ok "rust already installed"
-        elif run_user "$TARGET_USER" bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'; then ok "rust installed"
+        elif run_user "$TARGET_USER" bash -o pipefail -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'; then ok "rust installed"
         else warn "rustup install failed"; fi
     fi
 
@@ -1486,7 +1604,7 @@ step_toolchains() {
 
     if confirm "Install uv (Python package manager)?" y; then
         if user_cmd_exists uv; then ok "uv already installed"
-        elif run_user "$TARGET_USER" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'; then ok "uv installed"
+        elif run_user "$TARGET_USER" bash -o pipefail -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'; then ok "uv installed"
         else warn "uv install failed"; fi
     fi
     return 0
@@ -1500,13 +1618,13 @@ _install_vscode() {
         apt)
             local keyring=/etc/apt/keyrings/packages.microsoft.gpg
             asroot install -m 0755 -d /etc/apt/keyrings || return 1
-            curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-                | asroot gpg --dearmor --yes -o "$keyring" || return 1
+            fetch_key https://packages.microsoft.com/keys/microsoft.asc "$keyring" || return 1
             asroot chmod a+r "$keyring" 2>/dev/null || true
             printf 'deb [arch=amd64,arm64,armhf signed-by=%s] https://packages.microsoft.com/repos/code stable main\n' \
                 "$keyring" | asroot tee /etc/apt/sources.list.d/vscode.list >/dev/null || return 1
             apt_get update -qq || true
             apt_get install -y code || return 1
+            register_managed "code" "distro:apt"
             ;;
         dnf|yum)
             asroot rpm --import https://packages.microsoft.com/keys/microsoft.asc || return 1
@@ -1547,17 +1665,18 @@ _install_vscode_extensions() {
     user_cmd_exists uv     && exts+=(ms-python.python charliermarsh.ruff)
     user_cmd_exists dotnet && exts+=(ms-dotnettools.csharp)
 
-    info "installing ${#exts[@]} extension(s) for $TARGET_USER..."
-    local e ok_n=0
+    info "offering ${#exts[@]} extension(s) for $TARGET_USER..."
+    local e failed_n=0
     for e in "${exts[@]}"; do
+        confirm "Install VS Code extension $e?" y || continue
         if run_user "$TARGET_USER" code --install-extension "$e" --force >/dev/null 2>&1; then
             ok "extension: $e"
-            ok_n=$((ok_n + 1))
         else
             warn "extension install failed: $e"
+            failed_n=$((failed_n + 1))
         fi
     done
-    [[ $ok_n -gt 0 ]]
+    [[ $failed_n -eq 0 ]]
 }
 
 step_vscode() {
@@ -1574,8 +1693,8 @@ step_vscode() {
 
     command -v code >/dev/null 2>&1 || { warn "'code' CLI not on PATH; skipping extensions"; return 0; }
 
-    if confirm "Install VS Code extensions (clangd, Dev Containers, Docker + matching toolchains)?" y; then
-        _install_vscode_extensions || warn "some extensions failed to install; see messages above"
+    if confirm "Choose VS Code extensions (clangd, Dev Containers, Docker + matching toolchains)?" y; then
+        _install_vscode_extensions || { warn "some extensions failed to install; see messages above"; return 1; }
     fi
     return 0
 }
@@ -1586,9 +1705,15 @@ step_vscode() {
 _gitconfig_content() {
     local name email ghbin GIT_NAME GIT_EMAIL GH_BIN
     read_line "git user.name [${TARGET_USER}]: "; name="${REPLY:-${TARGET_USER}}"
-    read_line "git user.email [${TARGET_USER}@$(hostname)]: "; email="${REPLY:-${TARGET_USER}@$(hostname)}"
+    read_line "git user.email [${TARGET_USER}@$(host_name)]: "; email="${REPLY:-${TARGET_USER}@$(host_name)}"
     ghbin="$(command -v gh 2>/dev/null || echo /usr/bin/gh)"
-    GIT_NAME="$name"; GIT_EMAIL="$email"; GH_BIN="$ghbin"
+    # Used by name through subst_template's indirect variable expansion.
+    # shellcheck disable=SC2034
+    GIT_NAME="$name"
+    # shellcheck disable=SC2034
+    GIT_EMAIL="$email"
+    # shellcheck disable=SC2034
+    GH_BIN="$ghbin"
     subst_template "$FILES_DIR/gitconfig" GIT_NAME GIT_EMAIL GH_BIN TARGET_HOME
 }
 
@@ -1610,30 +1735,31 @@ _cost_aggregate_script_content() {
 
 _install_statusline_script() { # _install_statusline_script HOME
     local home="$1" tmp
-    tmp="$(new_tmp)"
+    tmp="$(new_tmp)" || return 1
 
     if ! read_file "claude/statusline-command.sh" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
-    asroot install -D -m 0755 "$tmp" "$home/.claude/statusline-command.sh"
+    asroot install -D -m 0755 "$tmp" "$home/.claude/statusline-command.sh" || return 1
     asroot chown "$TARGET_USER:" "$home/.claude/statusline-command.sh" 2>/dev/null || true
 
-    tmp="$(new_tmp)"
+    tmp="$(new_tmp)" || return 1
     if ! read_file "claude/cost_aggregate.py" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
-    asroot install -D -m 0755 "$tmp" "$home/.claude/cost_aggregate.py"
+    asroot install -D -m 0755 "$tmp" "$home/.claude/cost_aggregate.py" || return 1
     asroot chown "$TARGET_USER:" "$home/.claude/cost_aggregate.py" 2>/dev/null || true
 
     ok "installed statusline scripts"
 }
 
 _merge_claude_settings() { # _merge_claude_settings HOME
-    local home="$1" existing="$home/.claude/settings.json"
-    local defaults tmp
-    tmp="$(new_tmp)"
+    local home="$1"
+    local existing="$home/.claude/settings.json"
+    local tmp
+    tmp="$(new_tmp)" || return 1
 
     if ! read_file "claude/settings.json" > "$tmp"; then
         rm -f "$tmp"
@@ -1642,19 +1768,49 @@ _merge_claude_settings() { # _merge_claude_settings HOME
 
     if [[ -f "$existing" ]]; then
         if command -v jq >/dev/null 2>&1; then
-            jq -s '.[0] * .[1]' "$tmp" "$existing" > "$tmp.merged"
+            jq -s '.[0] * .[1]' "$tmp" "$existing" > "$tmp.merged" || return 1
             mv "$tmp.merged" "$tmp"
         else
-            warn "jq not found; using default Claude settings (preserve manually if needed)"
+            warn "jq not found; keeping existing Claude settings"
+            return 0
         fi
     fi
 
-    asroot install -D -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$existing"
+    asroot install -D -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$existing" || return 1
     ok "wrote $existing"
 }
 
-_opencode_config_content() {
-    read_file "opencode/opencode.jsonc"
+# Copy only selected settings files. Auth stores, session databases, caches,
+# plugins and machine-local state are not part of a config transfer.
+_ai_config_content() { cat -- "$AI_CONFIG_SOURCE"; }
+
+_install_ai_configs() { # one prompt per app, like the other dotfiles
+    local home="$1" app name dir AI_CONFIG_SOURCE failed=0 default
+    local -a names present
+    for app in opencode codex; do
+        if [[ "$app" == opencode ]]; then
+            names=(opencode.json opencode.jsonc tui.json)
+            dir="$home/.config/opencode"
+        else
+            names=(config.toml AGENTS.md)
+            dir="$home/.codex"
+        fi
+        present=()
+        default=y
+        for name in "${names[@]}"; do
+            [[ -f "$FILES_DIR/$app/$name" ]] || continue
+            present+=("$name")
+            # Don't clobber settings the target already has unless asked.
+            [[ ! -e "$dir/$name" ]] || default=n
+        done
+        [[ ${#present[@]} -gt 0 ]] || continue
+        confirm "Write $app config ($dir: ${present[*]})?" "$default" || continue
+        for name in "${present[@]}"; do
+            AI_CONFIG_SOURCE="$FILES_DIR/$app/$name"
+            _write_file "$dir/$name" _ai_config_content 0600 || failed=1
+        done
+    done
+    return "$failed"
 }
 
 _tmux_content() {
@@ -1706,8 +1862,8 @@ _report_git_signing_status() {
     email="$(run_user "$TARGET_USER" git config --global --get user.email 2>/dev/null || echo "")"
     name="$(run_user "$TARGET_USER" git config --global --get user.name 2>/dev/null || echo "")"
 
-    local has_key=0 has_allowed=0 has_pub=0
-    local key_path="" pub_path=""
+    local has_allowed=0 has_pub=0
+    local pub_path=""
     if [[ -n "$sk" ]]; then
         # signingkey may be a path to .pub or the key material itself
         if [[ "$sk" == ssh-* ]]; then
@@ -1716,8 +1872,6 @@ _report_git_signing_status() {
         elif run_user "$TARGET_USER" bash -c "test -f \"$sk\"" 2>/dev/null; then
             has_pub=1
             pub_path="$sk"
-            key_path="${sk%.pub}"
-            if run_user "$TARGET_USER" bash -c "test -f \"$key_path\"" 2>/dev/null; then has_key=1; fi
             info "  git user.signingkey: $sk $(run_user "$TARGET_USER" ssh-keygen -l -f "$sk" 2>/dev/null | sed 's/^/  /' || echo "")"
         else
             warn "  git user.signingkey: $sk (file not found)"
@@ -1751,7 +1905,8 @@ _report_git_signing_status() {
             pubkey_for_check="$(printf '%s' "$sk" | cut -d' ' -f2)"
         else
             # fallback to detected key
-            local det="$( _find_existing_ssh_key 2>/dev/null || echo "")"
+            local det
+            det="$( _find_existing_ssh_key 2>/dev/null || true)"
             if [[ -n "$det" ]]; then
                 pubkey_for_check="$(run_user "$TARGET_USER" bash -c "cut -d' ' -f2 < \"${det}.pub\"" 2>/dev/null || echo "")"
             fi
@@ -1807,7 +1962,7 @@ _setup_ssh_signing() {
     local ssh_dir="$TARGET_HOME/.ssh"
     local email key pub
     email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
-    email="${email:-${TARGET_USER}@$(hostname)}"
+    email="${email:-${TARGET_USER}@$(host_name)}"
 
     printf '\n%sCurrent signing config for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
     if _report_git_signing_status; then
@@ -1853,11 +2008,7 @@ _setup_ssh_signing() {
         key="$ssh_dir/id_ed25519"
         pub="$key.pub"
         info "no existing SSH key found; generating a fresh ed25519 key at $key"
-        if [[ $EUID -eq 0 ]]; then
-            run_user "$TARGET_USER" bash -c "ssh-keygen -t ed25519 -N '' -C '$email' -f '$key'" || { warn "ssh-keygen failed"; return 1; }
-        else
-            ssh-keygen -t ed25519 -N "" -C "$email" -f "$key" || { warn "ssh-keygen failed"; return 1; }
-        fi
+        run_user "$TARGET_USER" ssh-keygen -t ed25519 -N "" -C "$email" -f "$key" || { warn "ssh-keygen failed"; return 1; }
         asroot chmod 600 "$key" 2>/dev/null || true
         asroot chmod 644 "$pub" 2>/dev/null || true
         ok "generated $key"
@@ -1930,7 +2081,7 @@ _setup_ssh_signing() {
     # allowed_signers: format is "PRINCIPAL SPACED_PUBKEY" (e.g. "user@host ssh-ed25519 AAAAC3... user@host")
     # Previous bug used "email pubkey email" (duplicate trailing principal). Fix by using single principal.
     local tmp
-    tmp="$(new_tmp)"
+    tmp="$(new_tmp)" || return 1
     printf '%s %s\n' "$email" "$pubkey" > "$tmp"
     # If allowed_signers already contains this exact pubkey, don't duplicate
     local key_material
@@ -1942,7 +2093,7 @@ _setup_ssh_signing() {
         # If allowed_signers exists and has other keys, preserve them and append this one.
         if [[ -f "$ssh_dir/allowed_signers" ]] && ! grep -qF "$key_material" "$ssh_dir/allowed_signers" 2>/dev/null; then
             local merged
-            merged="$(new_tmp)"
+            merged="$(new_tmp)" || return 1
             cat "$ssh_dir/allowed_signers" > "$merged" 2>/dev/null || true
             cat "$tmp" >> "$merged"
             mv "$merged" "$tmp"
@@ -1964,7 +2115,8 @@ _setup_ssh_signing() {
     # The old script only uploaded an authentication key, so commits showed "Unverified"
     # even though push worked. Now we upload both when gh is authenticated.
     if command -v gh >/dev/null 2>&1 && run_user "$TARGET_USER" bash -c 'gh auth status >/dev/null 2>&1'; then
-        local title="bootstrap-$(hostname)-$(date +%Y%m%d)"
+        local title
+        title="bootstrap-$(host_name)-$(date +%Y%m%d)"
         local already_auth=0 already_sign=0
 
         # Check auth key exists (match by key material to avoid duplicate titles)
@@ -2021,14 +2173,14 @@ _setup_ssh_signing() {
 # as the target user, make a signed commit, and verify the signature is Good.
 _validate_git_signing() {
     local repo sig email pub signing_key allowed
-    repo="$(new_tmpdir)"
+    repo="$(new_tmpdir)" || return 1
     asroot chown -R "$TARGET_USER:" "$repo" 2>/dev/null || true
 
     # Use the actual configured email/signingkey/allowedSigners so the test
     # matches the real repo config (previous version used a fake test email
     # that never matched allowed_signers, so it always reported failure).
     email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
-    email="${email:-${TARGET_USER}@$(hostname)}"
+    email="${email:-${TARGET_USER}@$(host_name)}"
     signing_key="$(run_user "$TARGET_USER" git config --global user.signingkey 2>/dev/null)"
     allowed="$(run_user "$TARGET_USER" git config --global gpg.ssh.allowedSignersFile 2>/dev/null)"
     # Fall back to detected key if git config not yet set
@@ -2101,13 +2253,9 @@ _setup_passwordless_ssh() {
         fi
         local email
         email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
-        email="${email:-${TARGET_USER}@$(hostname)}"
+        email="${email:-${TARGET_USER}@$(host_name)}"
         asroot install -d -m 700 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$ssh_dir"
-        if [[ $EUID -eq 0 ]]; then
-            run_user "$TARGET_USER" bash -c "ssh-keygen -t ed25519 -N '' -C '$email' -f '$key'" || { warn "ssh-keygen failed"; return 1; }
-        else
-            ssh-keygen -t ed25519 -N "" -C "$email" -f "$key" || { warn "ssh-keygen failed"; return 1; }
-        fi
+        run_user "$TARGET_USER" ssh-keygen -t ed25519 -N "" -C "$email" -f "$key" || { warn "ssh-keygen failed"; return 1; }
         asroot chmod 600 "$key" 2>/dev/null || true
         asroot chmod 644 "$pub" 2>/dev/null || true
         ok "generated $key"
@@ -2139,7 +2287,7 @@ _setup_passwordless_ssh() {
         local copy_ok=0
         # Prefer ssh-copy-id when available (handles authorized_keys creation + perms)
         if run_user "$TARGET_USER" bash -c "command -v ssh-copy-id >/dev/null 2>&1"; then
-            if run_user "$TARGET_USER" bash -c "ssh-copy-id -i \"$pub\" \"$dest\" 2>&1 | sed 's/^/  /'"; then
+            if run_user "$TARGET_USER" bash -o pipefail -c "ssh-copy-id -i \"$pub\" \"$dest\" 2>&1 | sed 's/^/  /'"; then
                 copy_ok=1
             else
                 warn "ssh-copy-id failed for $dest"
@@ -2179,7 +2327,7 @@ _setup_passwordless_ssh() {
 
 step_configs() {
     ensure_user_dirs
-    if ! confirm "Install dotfiles (git, ghostty, claude code, opencode, tmux)?" y; then return 0; fi
+    if ! confirm "Install dotfiles (git, ghostty, claude code, opencode, codex, tmux)?" y; then return 0; fi
     local home="$TARGET_HOME"
 
     # Show existing git identity/signing config before asking to overwrite
@@ -2196,10 +2344,10 @@ step_configs() {
     fi
     printf '\n'
 
-    local gitconfig_prompt="Set up ~/.gitconfig (asks for your name/email)?"
+    local gitconfig_prompt="Set up $home/.gitconfig (asks for your name/email)?"
     local gitconfig_default="y"
     if [[ -f "$home/.gitconfig" ]]; then
-        gitconfig_prompt="~/.gitconfig already exists — overwrite with new name/email?"
+        gitconfig_prompt="$home/.gitconfig already exists — overwrite with new name/email?"
         gitconfig_default="n"
     fi
     if confirm "$gitconfig_prompt" "$gitconfig_default"; then
@@ -2221,9 +2369,7 @@ step_configs() {
         _merge_claude_settings "$home"
     fi
 
-    if confirm "Write opencode config (~/.config/opencode/opencode.jsonc)?" y; then
-        _write_file "$home/.config/opencode/opencode.jsonc" _opencode_config_content
-    fi
+    _install_ai_configs "$home" || { warn "AI config copy failed"; return 1; }
 
     if confirm "Write tmux config (~/.tmux.conf)?" y; then
         _write_file "$home/.tmux.conf" _tmux_content
@@ -2276,8 +2422,7 @@ step_configs() {
 _ffmpeg_apt_repo() {
     local keyring=/etc/apt/keyrings/ffmpeg.gpg
     asroot install -m 0755 -d /etc/apt/keyrings || return 1
-    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4A7F0DDDBEB5A8B4" \
-        | asroot gpg --dearmor --yes -o "$keyring" || return 1
+    fetch_key "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4A7F0DDDBEB5A8B4" "$keyring" || return 1
     printf 'deb [signed-by=%s] https://ppa.launchpadcontent.net/ffmpeg/ffmpeg/ubuntu %s main\n' \
         "$keyring" "${CODENAME:-$VERSION_ID}" | asroot tee /etc/apt/sources.list.d/ffmpeg-ffmpeg.list >/dev/null || return 1
     apt_get update -qq || true
@@ -2311,7 +2456,7 @@ install_ffmpeg() {
             ver="$(curl -fsSL https://api.github.com/repos/eugeneware/ffmpeg-static/releases/latest \
                 | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')"
             if [[ -n "$ver" ]]; then
-                tmp="$(new_tmp)"
+                tmp="$(new_tmp)" || return 1
                 printf '%s\n' "downloading ffmpeg-static v${ver}..."
                 curl -fSL --retry 2 -# -o "$tmp" "https://github.com/eugeneware/ffmpeg-static/releases/download/v${ver}/ffmpeg-${ARCH}" || return 1
                 chmod +x "$tmp"
@@ -2342,11 +2487,12 @@ install_edge() {
             fi
             local keyring=/etc/apt/keyrings/microsoft-edge.gpg
             asroot install -m 0755 -d /etc/apt/keyrings || return 1
-            curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | asroot gpg --dearmor --yes -o "$keyring" || return 1
+            fetch_key https://packages.microsoft.com/keys/microsoft.asc "$keyring" || return 1
             printf 'Types: deb\nURIs: https://packages.microsoft.com/repos/edge\nSuites: stable\nComponents: main\nSigned-By: %s\nArchitectures: amd64\n' \
                 "$keyring" | asroot tee /etc/apt/sources.list.d/microsoft-edge.sources >/dev/null || return 1
             apt_get update -qq || true
             apt_get install -y microsoft-edge-stable || return 1
+            register_managed "microsoft-edge-stable" "distro:apt"
             ;;
         dnf|yum)
             curl -fsSL https://packages.microsoft.com/yumrepos/edge/config.repo | asroot tee /etc/yum.repos.d/microsoft-edge.repo >/dev/null || return 1
@@ -2361,9 +2507,10 @@ install_edge() {
 }
 
 step_extras() {
-    install_ffmpeg
-    install_edge
-    return 0
+    local failed=0
+    install_ffmpeg || failed=1
+    install_edge || failed=1
+    return "$failed"
 }
 
 # ----------------------------------------------------------------------------
@@ -2384,7 +2531,7 @@ _install_scpt() {
     # Remote/curl mode fallback: clone from GitHub
     if [[ -z "$found" ]]; then
         info "scpt source not found locally, cloning from GitHub..."
-        tmpdir="$(new_tmpdir)"
+        tmpdir="$(new_tmpdir)" || return 1
         if command -v git >/dev/null 2>&1 && git clone --depth 1 https://github.com/davidnoronha1/scpt.git "$tmpdir/scpt" 2>/dev/null; then
             found="$tmpdir/scpt/scpt.sh"
         else
@@ -2460,7 +2607,9 @@ _install_scpt() {
 step_scpt() {
     ensure_user_dirs
     # tmux is required for scpt; install if missing
-    if ! command -v tmux >/dev/null 2>&1; then
+    if [[ $OFFLINE -eq 1 ]]; then
+        command -v tmux >/dev/null 2>&1 || warn "offline: tmux not installed; scpt needs it to run"
+    elif ! command -v tmux >/dev/null 2>&1; then
         info "tmux not found (required for scpt), installing..."
         if ! _pm_install tmux; then
             warn "tmux install failed; scpt will be installed but needs tmux to run"
@@ -2468,7 +2617,7 @@ step_scpt() {
     else
         ok "tmux already installed: $(tmux -V 2>/dev/null | head -1)"
     fi
-    if ! command -v ssh >/dev/null 2>&1; then
+    if [[ $OFFLINE -eq 0 ]] && ! command -v ssh >/dev/null 2>&1; then
         info "openssh-client not found (required for scpt), installing..."
         _pm_install openssh-client 2>/dev/null || _pm_install openssh 2>/dev/null || warn "openssh-client install failed"
     fi
@@ -2533,7 +2682,7 @@ _install_rec() {
     # Remote/curl mode fallback: rec lives in this repo
     if [[ -z "$found" ]]; then
         info "rec source not found locally, cloning bootstrap repo from GitHub..."
-        tmpdir="$(new_tmpdir)"
+        tmpdir="$(new_tmpdir)" || return 1
         if command -v git >/dev/null 2>&1 \
             && git clone --depth 1 https://github.com/davidnoronha1/bootstrap.git "$tmpdir/bootstrap" 2>/dev/null \
             && [[ -f "$tmpdir/bootstrap/tools/rec/main.py" ]]; then
@@ -2596,7 +2745,11 @@ step_rec() {
 # ----------------------------------------------------------------------------
 summary() {
     printf '\n%s\n' "${C_GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
-    printf '%s Bootstrap complete %s\n' "${C_BOLD}" "${C_RESET}"
+    if [[ $FAILED_STEPS -eq 0 ]]; then
+        printf '%s Bootstrap complete %s\n' "$C_BOLD" "$C_RESET"
+    else
+        printf '%s Bootstrap finished with %s failed step(s) %s\n' "$C_BOLD" "$FAILED_STEPS" "$C_RESET"
+    fi
     for r in "${RESULTS[@]}"; do
         printf '   %s\n' "$r"
     done
@@ -2668,8 +2821,13 @@ parse_args() {
         case "$1" in
             -y|--yes) ASSUME_YES=1 ;;
             --remote) REMOTE_MODE=1 ;;
-            --user) USER_FLAG="${2:-}"; shift ;;
-            --files-dir) FILES_DIR="${2:-}"; shift ;;
+            --user|--files-dir)
+                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                    err "$1 requires a value"
+                    return 1
+                fi
+                if [[ "$1" == --user ]]; then USER_FLAG="$2"; else FILES_DIR="$2"; fi
+                shift ;;
             manage) shift; MANAGE_MODE="${1:-tui}"; MANAGE_ARG="${2:-}"; return 0 ;;
             --skip-user) SKIP_USER=1 ;;
             --skip-network) SKIP_NETWORK=1 ;;
@@ -2699,7 +2857,7 @@ parse_args() {
 #  Remote bootstrap: if this machine isn't the target, copy the script (and
 #  config files) to another host over ssh and run it there.
 # ----------------------------------------------------------------------------
-remote_bootstrap() {
+remote_bootstrap() (
     command -v ssh >/dev/null 2>&1 || { err "ssh not found; can't reach another machine"; return 1; }
     command -v tar >/dev/null 2>&1 || { err "tar not found; can't package the config files"; return 1; }
 
@@ -2718,28 +2876,115 @@ remote_bootstrap() {
         return 1
     fi
 
-    local remote_dir="/tmp/bootstrap-remote-$$"
-    info "preparing $remote_dir on the target..."
-    # shellcheck disable=SC2086
-    ssh $destline "rm -rf '$remote_dir' && mkdir -p '$remote_dir'" \
+    # Keep the socket private and short enough for Unix socket path limits.
+    # A dedicated master authenticates once; every later command must reuse it.
+    local socket_dir remote_dir="" remote_files="" master_ready=0
+    local -a destination ssh_opts
+    read -r -a destination <<< "$destline"
+    socket_dir="$(mktemp -d /tmp/bootstrap-ssh.XXXXXXXX)" || return 1
+    ssh_opts=(-o "ControlPath=$socket_dir/master" -o ControlMaster=no -o ControlPersist=no)
+
+    remote_cleanup() {
+        local rc=$?
+        trap - EXIT
+        if [[ $master_ready -eq 1 ]]; then
+            if [[ -n "$remote_dir" ]]; then
+                ssh "${ssh_opts[@]}" -o BatchMode=yes "${destination[@]}" \
+                    "rm -rf -- '$remote_dir'" >/dev/null 2>&1 || true
+            fi
+            ssh "${ssh_opts[@]}" -o BatchMode=yes -O exit "${destination[@]}" >/dev/null 2>&1 || true
+        fi
+        rm -rf -- "$socket_dir"
+        exit "$rc"
+    }
+    # Subshell-scoped traps also clean up failed transfers and interrupted runs.
+    trap remote_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    info "connecting to the target (SSH authentication is reused for all steps)..."
+    # Do not also pass -M: with ControlMaster=yes it toggles session approval on.
+    ssh -o "ControlPath=$socket_dir/master" -o ControlMaster=yes -o ControlPersist=no \
+        -N -f "${destination[@]}" \
         || { err "could not reach $destline over ssh"; return 1; }
+    master_ready=1
+    ssh_opts+=(-o BatchMode=yes)
+
+    remote_dir="$(ssh "${ssh_opts[@]}" "${destination[@]}" 'mktemp -d /tmp/bootstrap-remote.XXXXXXXX')" \
+        || { err "could not create staging directory in /tmp on $destline"; return 1; }
+    # Only use the expected path in subsequent remote shell commands/cleanup.
+    if [[ ! "$remote_dir" =~ ^/tmp/bootstrap-remote\.[[:alnum:]]{8}$ ]]; then
+        remote_dir=""
+        err "unexpected remote staging path"
+        return 1
+    fi
+    info "preparing $remote_dir on the target..."
+
+    # Minimal images (Alpine, some containers) lack bash or tar; fail clearly
+    # instead of with a confusing transfer error.
+    local missing
+    missing="$(ssh "${ssh_opts[@]}" "${destination[@]}" \
+        'for c in bash tar; do command -v "$c" >/dev/null 2>&1 || printf "%s " "$c"; done')" \
+        || { err "could not run commands on $destline"; return 1; }
+    if [[ -n "$missing" ]]; then
+        err "the target is missing: ${missing% } (install it there first, e.g. 'apk add bash tar')"
+        return 1
+    fi
+
+    # The running file may be named differently, or absent under curl | bash.
+    local script_src="${SCRIPT_FILE:-$SCRIPT_DIR/bootstrap.sh}"
+    if [[ ! -f "$script_src" ]]; then
+        command -v curl >/dev/null 2>&1 || { err "no local copy of bootstrap.sh and curl is missing"; return 1; }
+        script_src="$(new_tmp)" || return 1
+        info "downloading bootstrap.sh..."
+        curl -fsSL https://raw.githubusercontent.com/davidnoronha1/bootstrap/main/bootstrap.sh -o "$script_src" \
+            || { err "could not download bootstrap.sh"; return 1; }
+    fi
 
     # Stream everything over ssh itself (no scp), so any ssh flags the user
     # gives - keyfiles (-i), ports (-p), ProxyJump, -o options - apply to all
     # transfers and the remote run alike.
     info "copying bootstrap.sh..."
-    cat "$0" | ssh $destline "cat > '$remote_dir/bootstrap.sh'" \
+    ssh "${ssh_opts[@]}" "${destination[@]}" "cat > '$remote_dir/bootstrap.sh'" < "$script_src" \
         || { err "could not copy bootstrap.sh to $destline"; return 1; }
 
     if [[ -d "$FILES_DIR" ]]; then
         info "copying config files..."
-        local parent base
-        parent="$(cd -- "$(dirname -- "$FILES_DIR")" 2>/dev/null && pwd -P)"
-        base="$(basename "$FILES_DIR")"
-        tar -C "$parent" -cf - "$base" | ssh $destline "tar -xf - -C '$remote_dir'" \
+        remote_files="$remote_dir/files"
+        tar -C "$FILES_DIR" -cf - . | ssh "${ssh_opts[@]}" "${destination[@]}" \
+            "mkdir -p '$remote_files' && tar -xf - -C '$remote_files'" \
             || { err "could not copy config files to $destline"; return 1; }
     else
         warn "no local config files dir; dotfile/config steps will be skipped on the target"
+    fi
+
+    # Stage this computer's AI settings over the repository defaults, without
+    # asking: whether to install them is decided by the configs step on the
+    # target, like every other dotfile. Never write live user settings into
+    # the checkout or copy whole app homes (auth, history, caches).
+    if [[ $SKIP_CONFIGS -eq 0 ]]; then
+        local app config_source name
+        local -a config_names config_files
+        for app in opencode codex; do
+            config_files=()
+            if [[ "$app" == opencode ]]; then
+                config_source="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+                config_names=(opencode.json opencode.jsonc tui.json)
+            else
+                config_source="${CODEX_HOME:-$HOME/.codex}"
+                config_names=(config.toml AGENTS.md)
+            fi
+            for name in "${config_names[@]}"; do
+                [[ ! -f "$config_source/$name" ]] || config_files+=("$name")
+            done
+            [[ ${#config_files[@]} -gt 0 ]] || continue
+            info "staging local $app settings (${config_files[*]})..."
+            remote_files="$remote_dir/files"
+            tar -C "$config_source" -cf - "${config_files[@]}" | \
+                ssh "${ssh_opts[@]}" "${destination[@]}" \
+                    "mkdir -p '$remote_files/$app' && tar -xf - -C '$remote_files/$app'" \
+                || { err "could not copy $app settings to $destline"; return 1; }
+        done
     fi
 
     # Also copy tools/ (scpt, rec) if present so those steps work remotely
@@ -2747,29 +2992,34 @@ remote_bootstrap() {
     for tool in scpt rec; do
         [[ -d "$SCRIPT_DIR/tools/$tool" ]] || continue
         info "copying $tool tool..."
-        tar -C "$SCRIPT_DIR" --exclude=__pycache__ --exclude=.venv -cf - "tools/$tool" | ssh $destline "tar -xf - -C '$remote_dir'" \
+        tar -C "$SCRIPT_DIR" --exclude=__pycache__ --exclude=.venv -cf - "tools/$tool" | ssh "${ssh_opts[@]}" "${destination[@]}" "tar -xf - -C '$remote_dir'" \
             || warn "could not copy $tool tool to $destline ($tool step will fallback to git clone)"
     done
 
     # Forward the original flags but drop --files-dir (the copied files/ dir is
     # used instead) and mark the remote run so it doesn't re-ask this question.
     local FWD_ARGS=() skip=0 a
-    for a in "${ORIGINAL_ARGS[@]:-}"; do
+    for a in "${ORIGINAL_ARGS[@]}"; do
         if [[ $skip -eq 1 ]]; then skip=0; continue; fi
         if [[ "$a" == "--files-dir" ]]; then skip=1; continue; fi
         FWD_ARGS+=("$a")
     done
-    FWD_ARGS+=("--remote")
+    [[ -z "$remote_files" ]] || FWD_ARGS=(--files-dir "$remote_files" "${FWD_ARGS[@]}")
+    FWD_ARGS=(--remote "${FWD_ARGS[@]}")
     local qargs
     qargs="$(printf '%q ' "${FWD_ARGS[@]}")"
 
-    info "starting bootstrap on the target (launched from $(hostname))..."
-    # shellcheck disable=SC2086
-    ssh $destline "cd '$remote_dir' && bash bootstrap.sh $qargs"
-    local rc=$?
-    ssh $destline "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
-    return "$rc"
-}
+    info "starting bootstrap on the target (launched from $(host_name))..."
+    local run_cmd="cd '$remote_dir' && bash bootstrap.sh $qargs"
+    # -t needs a terminal on stdin; under curl | bash that's the pipe, so
+    # borrow the controlling terminal or the remote prompts get no input.
+    if [[ ! -t 0 ]] && { : </dev/tty; } 2>/dev/null; then
+        ssh "${ssh_opts[@]}" -t "${destination[@]}" "$run_cmd" </dev/tty
+    else
+        ssh "${ssh_opts[@]}" -t "${destination[@]}" "$run_cmd"
+    fi
+    return $?
+)
 
 # ----------------------------------------------------------------------------
 #  Interrupt handling
@@ -2794,14 +3044,18 @@ main() {
     ORIGINAL_ARGS=("$@")
     parse_args "$@" || exit 1
     init_colors
-    trap cleanup_tmp EXIT
+    trap 'stop_sudo_keepalive; cleanup_tmp' EXIT
     trap 'on_signal INT' INT
     trap 'on_signal TERM' TERM
 
+    init_tmp || { err "could not create temporary directory in /tmp"; exit 1; }
+
     # Locate the config files directory: --files-dir > BOOTSTRAP_FILES_DIR >
     # ./files next to this script.
+    SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+    # Empty under `curl ... | bash`; remote_bootstrap then downloads a copy.
+    [[ -f "${BASH_SOURCE[0]}" ]] && SCRIPT_FILE="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
     if [[ -z "$FILES_DIR" ]]; then
-        SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
         FILES_DIR="${BOOTSTRAP_FILES_DIR:-$SCRIPT_DIR/files}"
     fi
     if [[ ! -d "$FILES_DIR" ]]; then
@@ -2863,22 +3117,28 @@ main() {
         exit 1
     fi
 
-    if [[ $SKIP_USER -eq 1 ]]; then skip_step "User setup"; else run_step "User setup" step_user; fi
-    if [[ $SKIP_NETWORK -eq 1 ]]; then skip_step "Network"; else run_step "Network" step_network; fi
-    if [[ $SKIP_DOCKER -eq 1 ]]; then skip_step "Docker + Compose"; else run_step "Docker + Compose" step_docker; fi
-    if [[ $SKIP_NVIDIA -eq 1 ]]; then skip_step "NVIDIA container toolkit"; else run_step "NVIDIA container toolkit" step_nvidia; fi
-    if [[ $SKIP_GHOSTTY -eq 1 ]]; then skip_step "Ghostty + terminfo"; else run_step "Ghostty + terminfo" step_ghostty; fi
-    if [[ $SKIP_TOOLS -eq 1 ]]; then skip_step "Dev tools"; else run_step "Dev tools" step_tools; fi
-    if [[ $SKIP_NVIM -eq 1 ]]; then skip_step "Neovim + LazyVim"; else run_step "Neovim + LazyVim" step_neovim; fi
-    if [[ $SKIP_TOOLCHAINS -eq 1 ]]; then skip_step "Language toolchains"; else run_step "Language toolchains" step_toolchains; fi
-    if [[ $SKIP_VSCODE -eq 1 ]]; then skip_step "VS Code + extensions"; else run_step "VS Code + extensions" step_vscode; fi
-    if [[ $SKIP_CONFIGS -eq 1 ]]; then skip_step "Dotfiles / configs"; else run_step "Dotfiles / configs" step_configs; fi
-    if [[ $SKIP_EXTRAS -eq 1 ]]; then skip_step "Extra apps (ffmpeg, edge)"; else run_step "Extra apps (ffmpeg, edge)" step_extras; fi
-    if [[ $SKIP_SCPT -eq 1 ]]; then skip_step "scpt (tmux SSH helper + file transfer)"; else run_step "scpt (tmux SSH helper + file transfer)" step_scpt; fi
-    if [[ $SKIP_REC -eq 1 ]]; then skip_step "rec (screen recorder)"; else run_step "rec (screen recorder)" step_rec; fi
+    maybe_step "$SKIP_USER" local "User setup" step_user
+    maybe_step "$SKIP_NETWORK" local "Network" step_network
+    # The network step may have just fixed connectivity (e.g. DNS servers).
+    if [[ $OFFLINE -eq 1 ]] && check_network >/dev/null 2>&1 && ensure_download_tools; then
+        ok "network is reachable now; download steps re-enabled"
+        OFFLINE=0
+    fi
+    maybe_step "$SKIP_DOCKER" net "Docker + Compose" step_docker
+    maybe_step "$SKIP_NVIDIA" net "NVIDIA container toolkit" step_nvidia
+    maybe_step "$SKIP_GHOSTTY" net "Ghostty + terminfo" step_ghostty
+    maybe_step "$SKIP_TOOLS" net "Dev tools" step_tools
+    maybe_step "$SKIP_NVIM" net "Neovim + LazyVim" step_neovim
+    maybe_step "$SKIP_TOOLCHAINS" net "Language toolchains" step_toolchains
+    maybe_step "$SKIP_VSCODE" net "VS Code + extensions" step_vscode
+    maybe_step "$SKIP_CONFIGS" local "Dotfiles / configs" step_configs
+    maybe_step "$SKIP_EXTRAS" net "Extra apps (ffmpeg, edge)" step_extras
+    maybe_step "$SKIP_SCPT" local "scpt (tmux SSH helper + file transfer)" step_scpt
+    maybe_step "$SKIP_REC" net "rec (screen recorder)" step_rec
 
     ensure_home_ownership
     summary
+    [[ $FAILED_STEPS -eq 0 ]]
 }
 
 main "$@"

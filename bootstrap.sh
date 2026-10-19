@@ -27,6 +27,7 @@ set -uo pipefail
 VERSION="1.5.0"
 ASSUME_YES=0
 TUI_OFF=0
+VERBOSE=0   # --verbose: show package-manager output even when it succeeds
 REMOTE_MODE=0
 MANAGE_MODE=""
 MANAGE_ARG=""
@@ -399,7 +400,7 @@ render_bar() { # render_bar DONE TOTAL WIDTH -> bar string (no color codes)
 
 spinner() {
     local msg="$1"; shift
-    if [[ -t 1 && $TUI_OFF -eq 0 ]]; then
+    if [[ -t 1 && $TUI_OFF -eq 0 && $VERBOSE -eq 0 ]]; then
         local done="${#RESULTS[@]}" bar suffix
         bar="$(render_bar "$done" "$STEPS_TOTAL" 14)"
         suffix=" ${C_ORANGE}${bar}${C_RESET}"
@@ -420,7 +421,7 @@ spinner() {
             printf '%s %s%s%s\n' "${C_GREEN}✓${C_RESET}" "$C_DIM" "$msg" "$C_RESET"
         else
             printf '%s %s%s%s\n' "${C_RED}✗${C_RESET}" "$C_DIM" "$msg" "$C_RESET"
-            [[ -s "$log" ]] && sed 's/^/    /' "$log" >&2
+            [[ -s "$log" ]] && tail -n 40 "$log" | sed 's/^/    /' >&2
         fi
         rm -f "$log"
         return "$rc"
@@ -519,7 +520,9 @@ run_user() { # run_user USER cmd args...
     # Deliberately no trailing $PATH: inheriting the invoking user's PATH would
     # make existence checks (user_cmd_exists) resolve tools that belong to the
     # wrong user when TARGET_USER differs from the one running the script.
-    script='export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin"; cd "$HOME" || exit 1; eval "$ARG_CMD"'
+    # Also covers tools installed before this run by other means (nvm, go,
+    # deno, volta, pnpm, pyenv, linuxbrew), so they aren't offered again.
+    script='export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.opencode/bin:$HOME/.dotnet:$HOME/.dotnet/tools:/usr/local/go/bin:$HOME/go/bin:$HOME/.deno/bin:$HOME/.volta/bin:$HOME/.local/share/pnpm:$HOME/.yarn/bin:$HOME/.npm-global/bin:$HOME/.pyenv/shims:$HOME/.pyenv/bin:/home/linuxbrew/.linuxbrew/bin:/snap/bin"; for d in "$HOME"/.nvm/versions/node/*/bin; do [ -d "$d" ] && PATH="$PATH:$d"; done; cd "$HOME" || exit 1; eval "$ARG_CMD"'
     argcmd="$(printf '%q ' "$@")"
     if [[ $EUID -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
         ARG_CMD="$argcmd" runuser -u "$u" -- env HOME="$home" bash -c "$script"
@@ -550,7 +553,55 @@ apt_get() {
         apt-get -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
+# Run a command with its output hidden unless it fails (or --verbose): a
+# spinner on a terminal, otherwise captured to a log whose tail is shown on
+# failure. Used for package managers so a successful apt run stays one line.
+quiet() {
+    if [[ $VERBOSE -eq 1 ]]; then "$@"; return; fi
+    local log rc
+    log="$(new_tmp)" || { "$@"; return; }
+    "$@" </dev/null >"$log" 2>&1; rc=$?
+    if [[ $rc -ne 0 ]]; then
+        err "failed: $*"
+        tail -n 30 "$log" | sed 's/^/    /' >&2
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+
+run_quiet() { # run_quiet LABEL CMD...
+    local label="$1"; shift
+    if [[ -t 1 && $TUI_OFF -eq 0 && $VERBOSE -eq 0 ]]; then spinner "$label" "$@"
+    else info "$label"; quiet "$@"; fi
+}
+
+# Refresh package lists quietly; a failure (e.g. no DNS) is reported once and
+# the install that follows reports its own error.
+apt_update() {
+    quiet apt_get update -qq || warn "apt-get update failed; using cached package lists"
+}
+
+pkg_installed() { # pkg_installed PKG -> true if the package manager has it installed
+    case "$PM" in
+        apt)            dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed' ;;
+        dnf|yum|zypper) rpm -q --whatprovides "$1" >/dev/null 2>&1 ;;
+        pacman)         pacman -Qq "$1" >/dev/null 2>&1 ;;
+        apk)            apk info -e "$1" >/dev/null 2>&1 ;;
+        *)              return 1 ;;
+    esac
+}
+
+# Installs only the packages that are missing. Packages that were already
+# there are not recorded as managed, so `manage remove` never uninstalls
+# something this script didn't install.
 _pm_install() {
+    local pkg missing=()
+    for pkg in "$@"; do pkg_installed "$pkg" || missing+=("$pkg"); done
+    [[ ${#missing[@]} -gt 0 ]] || return 0
+    run_quiet "installing ${missing[*]}" _pm_install_now "${missing[@]}"
+}
+
+_pm_install_now() {
     case "$PM" in
         apt)   apt_get install -y "$@" && for pkg in "$@"; do register_managed "$pkg" "distro:apt"; done ;;
         dnf|yum) asroot "$PM" install -y "$@" && for pkg in "$@"; do register_managed "$pkg" "distro:$PM"; done ;;
@@ -563,11 +614,34 @@ _pm_install() {
 
 ensure_pkg() { # ensure_pkg BINARY PKGNAME
     command -v "$1" >/dev/null 2>&1 && return 0
-    info "installing $2 (provides $1)"
     case "$PM" in
-        apt) apt_get update -qq || true; apt_get install -y "$2" ;;
+        apt) apt_update; run_quiet "installing $2 (provides $1)" apt_get install -y "$2" ;;
         *)   _pm_install "$2" ;;
     esac
+}
+
+have() { # have CMD...  -> true if any of the commands exists
+    local c
+    for c in "$@"; do command -v "$c" >/dev/null 2>&1 && return 0; done
+    return 1
+}
+
+# Only ask about installing something that isn't there yet:
+#   want NAME "DESC" y|n CHECK_CMD...  -> 0 = install it, 1 = present or declined
+want() {
+    local name="$1" desc="$2" def="$3"
+    shift 3
+    if "$@" >/dev/null 2>&1; then
+        ok "$name already installed"
+        return 1
+    fi
+    confirm "Install $name${desc:+ ($desc)}?" "$def"
+}
+
+# Run a curl-piped installer as the target user, with a uniform result line.
+user_installer() { # user_installer NAME SCRIPT
+    if run_user "$TARGET_USER" bash -o pipefail -c "$2"; then ok "$1 installed"
+    else warn "$1 install failed"; fi
 }
 
 ensure_pkg_ask() { # ensure_pkg_ask BINARY PKGNAME DESC  (prompts only when missing)
@@ -982,11 +1056,11 @@ _docker_apt_repo() {
     dist="${CODENAME:-$VERSION_ID}"
     printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' \
         "$arch" "$ID" "$dist" | asroot tee /etc/apt/sources.list.d/docker.list >/dev/null || return 1
-    apt_get update -qq || return 1
+    quiet apt_get update -qq || return 1
 }
 
 _docker_apt_install() {
-    apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    run_quiet "installing docker" apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }
 
 # Set up a Docker credential store via the `pass` helper so `docker login`
@@ -1083,7 +1157,7 @@ step_docker() {
                 if ! _docker_apt_repo || ! _docker_apt_install; then
                     warn "official Docker repo failed; falling back to distro package"
                     asroot rm -f /etc/apt/sources.list.d/docker.list
-                    apt_get update -qq || true
+                    apt_update
                     _pm_install docker.io docker-compose-v2 2>/dev/null || _pm_install docker.io docker-compose || true
                 fi
                 ;;
@@ -1117,7 +1191,9 @@ step_docker() {
         fi
     fi
 
-    if confirm "Set up a Docker credential store (docker login creds kept in pass, not plaintext)?" y; then
+    if have docker-credential-pass && grep -qs '"credsStore": *"pass"' "$TARGET_HOME/.docker/config.json"; then
+        ok "docker credential store already set to 'pass'"
+    elif confirm "Set up a Docker credential store (docker login creds kept in pass, not plaintext)?" y; then
         _docker_creds_store || warn "docker credential store setup incomplete; see messages above"
     fi
     return 0
@@ -1148,7 +1224,7 @@ step_nvidia() {
             curl -fsSL "https://nvidia.github.io/libnvidia-container/${dist}/libnvidia-container.list" \
                 | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
                 | asroot tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null || return 1
-            apt_get update -qq || true
+            apt_update
             _pm_install nvidia-container-toolkit || { warn "nvidia-container-toolkit install failed"; return 1; }
             ;;
         dnf|yum)
@@ -1256,6 +1332,35 @@ _install_gh() {
     command -v gh >/dev/null 2>&1
 }
 
+# Codex CLI: standalone static (musl) binary from the latest GitHub release,
+# installed per-user like claude/opencode; npm only as a fallback.
+_install_codex() {
+    local carch tmp bin
+    case "$ARCH" in amd64) carch=x86_64 ;; arm64) carch=aarch64 ;; *) carch="" ;; esac
+    if [[ -n "$carch" ]]; then
+        tmp="$(new_tmpdir)" || return 1
+        printf '%s\n' "downloading codex (linux-${carch})..."
+        if curl -fSL --retry 2 -# -o "$tmp/codex.tar.gz" \
+            "https://github.com/openai/codex/releases/latest/download/codex-${carch}-unknown-linux-musl.tar.gz" \
+            && tar -xzf "$tmp/codex.tar.gz" -C "$tmp"; then
+            bin="$tmp/codex-${carch}-unknown-linux-musl"
+            if [[ -f "$bin" ]]; then
+                asroot install -D -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" \
+                    -m 0755 "$bin" "$TARGET_HOME/.local/bin/codex" || return 1
+                register_managed "codex" "tarball" "$TARGET_HOME/.local/bin/codex"
+                return 0
+            fi
+            warn "codex archive did not contain $(basename "$bin")"
+        fi
+    fi
+    if user_cmd_exists npm; then
+        run_user "$TARGET_USER" npm install -g --prefix "$TARGET_HOME/.local" @openai/codex
+    else
+        err "no codex release for $ARCH and npm is not installed"
+        return 1
+    fi
+}
+
 # Debian/Ubuntu ship fd/bat under different binary names to avoid clashes
 # with unrelated packages; symlink them into ~/.local/bin so `fd`/`bat` work.
 _symlink_local_bin() { # _symlink_local_bin SRC_BIN LINK_NAME
@@ -1293,114 +1398,115 @@ _install_zoxide() {
     run_user "$TARGET_USER" bash -o pipefail -c 'curl -fSL --retry 2 -# https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash'
 }
 
-write_rc_file() { # write_rc_file HOME RC_FILE NAME  (e.g. write_rc_file /home/bob .zshrc zshrc)
-    local home="$1" rcfile="$2" name="$3" tmp dest
-    dest="$home/$rcfile"
-    tmp="$(new_tmp)" || return 1
-    if ! read_file "$name" > "$tmp"; then
-        rm -f "$tmp"
-        return 1
+# Shell config: the managed settings live in ~/.config/bootstrap/<shell>rc and
+# ~/.bashrc / ~/.zshrc only get a small marked block that sources it. The
+# user's own rc (distro defaults, lines installers like nvm/bun/uv append,
+# personal edits) is kept, and re-runs just replace the block.
+RC_BEGIN="# >>> bootstrap.sh >>>"
+RC_END="# <<< bootstrap.sh <<<"
+RC_SHELL=""
+
+_rc_cat() { cat -- "$1" 2>/dev/null || asroot cat -- "$1" 2>/dev/null; }
+_rc_is_old_managed() { _rc_cat "$1" | head -n 1 | grep -q 'managed by bootstrap.sh'; }
+
+_managed_rc_content() { read_file "${RC_SHELL}rc"; }
+
+_user_rc_content() {
+    local rc="$TARGET_HOME/.${RC_SHELL}rc" base
+    base="$rc"
+    # Older versions replaced the whole file (saving the original as .bak):
+    # rebuild from that original, or from the distro default.
+    if [[ -f "$rc" ]] && _rc_is_old_managed "$rc"; then
+        if [[ -f "$rc.bak" ]] && ! _rc_is_old_managed "$rc.bak"; then
+            base="$rc.bak"
+        else
+            base="/etc/skel/.${RC_SHELL}rc"
+        fi
+    elif [[ ! -f "$rc" ]]; then
+        base="/etc/skel/.${RC_SHELL}rc"
     fi
-    if [[ -f "$dest" ]]; then
-        asroot cp -p "$dest" "$dest.bak" 2>/dev/null || true
-        asroot chown "$TARGET_USER:$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$dest.bak" 2>/dev/null || true
-        BACKED_UP_FILES+=("$dest:$dest.bak")
-        info "existing $rcfile backed up to $rcfile.bak"
-    else
-        CREATED_FILES+=("$dest")
+    if [[ -f "$base" ]]; then
+        # Drop a previous block, then trailing blank lines so re-runs don't grow the file.
+        _rc_cat "$base" | sed "/^$RC_BEGIN\$/,/^$RC_END\$/d" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+        printf '\n'
     fi
-    asroot install -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" -m 0644 "$tmp" "$dest" || return 1
-    rm -f "$tmp"
-    WRITTEN_RC="$rcfile"
-    ok "wrote $dest"
+    printf '%s\n' "$RC_BEGIN" \
+        "[ -f \"\$HOME/.config/bootstrap/${RC_SHELL}rc\" ] && . \"\$HOME/.config/bootstrap/${RC_SHELL}rc\"" \
+        "$RC_END"
+}
+
+_bash_profile_content() {
+    printf '%s\n' '# created by bootstrap.sh: login shells (e.g. ssh) load ~/.bashrc too' \
+        '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
+}
+
+install_shell_rc() { # install_shell_rc bash|zsh
+    local home="$TARGET_HOME"
+    RC_SHELL="$1"
+    _write_file "$home/.config/bootstrap/${RC_SHELL}rc" _managed_rc_content || return 1
+    _write_file "$home/.${RC_SHELL}rc" _user_rc_content || return 1
+    # Without any of these, bash login shells never read ~/.bashrc.
+    if [[ "$RC_SHELL" == bash && ! -e "$home/.bash_profile" && ! -e "$home/.bash_login" && ! -e "$home/.profile" ]]; then
+        _write_file "$home/.bash_profile" _bash_profile_content || return 1
+    fi
+    WRITTEN_RC=".${RC_SHELL}rc"
 }
 
 step_tools() {
     ensure_user_dirs
-    if confirm "Install git?" y; then
-        if command -v git >/dev/null 2>&1; then ok "git already installed"
-        else spinner "installing git" _pm_install git || warn "git install failed"; fi
+    if want git "" y have git; then
+        _pm_install git || warn "git install failed"
     fi
 
     local want_zsh=0
-    if confirm "Install zsh?" y; then
+    if have zsh; then
+        ok "zsh already installed"; want_zsh=1
+    elif confirm "Install zsh?" y; then
         want_zsh=1
-        if command -v zsh >/dev/null 2>&1; then ok "zsh already installed"
-        else spinner "installing zsh" _pm_install zsh || warn "zsh install failed"; fi
+        _pm_install zsh || warn "zsh install failed"
     fi
 
-    if confirm "Install btop (system monitor)?" y; then
-        if command -v btop >/dev/null 2>&1; then ok "btop already installed"
-        else spinner "installing btop" _pm_install btop || warn "btop install failed"; fi
+    if want btop "system monitor" y have btop; then
+        _pm_install btop || warn "btop install failed"
     fi
-
-    if confirm "Install ripgrep (rg - faster grep)?" y; then
-        if command -v rg >/dev/null 2>&1; then ok "ripgrep already installed"
-        else spinner "installing ripgrep" _pm_install ripgrep || warn "ripgrep install failed"; fi
+    if want ripgrep "rg - faster grep" y have rg; then
+        _pm_install ripgrep || warn "ripgrep install failed"
     fi
-
-    if confirm "Install fd (faster find)?" y; then
-        if command -v fd >/dev/null 2>&1 || command -v fdfind >/dev/null 2>&1; then ok "fd already installed"
-        else spinner "installing fd" _install_fd || warn "fd install failed"; fi
+    if want fd "faster find" y have fd fdfind; then
+        spinner "installing fd" _install_fd || warn "fd install failed"
     fi
-
-    if confirm "Install bat (cat with syntax highlighting)?" y; then
-        if command -v bat >/dev/null 2>&1 || command -v batcat >/dev/null 2>&1; then ok "bat already installed"
-        else spinner "installing bat" _install_bat || warn "bat install failed"; fi
+    if want bat "cat with syntax highlighting" y have bat batcat; then
+        spinner "installing bat" _install_bat || warn "bat install failed"
     fi
-
-    if confirm "Install zoxide (z - faster cd / navigation)?" y; then
-        if command -v zoxide >/dev/null 2>&1; then ok "zoxide already installed"
-        else spinner "installing zoxide" _install_zoxide || warn "zoxide install failed"; fi
+    if want zoxide "z - faster cd / navigation" y have zoxide; then
+        spinner "installing zoxide" _install_zoxide || warn "zoxide install failed"
     fi
-
-    if confirm "Install fzf (fuzzy finder, pairs well with rg/fd)?" y; then
-        if command -v fzf >/dev/null 2>&1; then ok "fzf already installed"
-        else spinner "installing fzf" _pm_install fzf || warn "fzf install failed"; fi
+    if want fzf "fuzzy finder, pairs well with rg/fd" y have fzf; then
+        _pm_install fzf || warn "fzf install failed"
     fi
-
-    if confirm "Install jq (JSON processor)?" y; then
-        if command -v jq >/dev/null 2>&1; then ok "jq already installed"
-        else spinner "installing jq" _pm_install jq || warn "jq install failed"; fi
+    if want jq "JSON processor" y have jq; then
+        _pm_install jq || warn "jq install failed"
     fi
-
-    if confirm "Install eza (modern ls replacement)?" n; then
-        if command -v eza >/dev/null 2>&1; then ok "eza already installed"
-        else spinner "installing eza" _pm_install eza || warn "eza install failed (not packaged on every distro)"; fi
+    if want eza "modern ls replacement" n have eza; then
+        _pm_install eza || warn "eza install failed (not packaged on every distro)"
     fi
-
-    if confirm "Install ncdu (interactive disk usage)?" n; then
-        if command -v ncdu >/dev/null 2>&1; then ok "ncdu already installed"
-        else spinner "installing ncdu" _pm_install ncdu || warn "ncdu install failed"; fi
+    if want ncdu "interactive disk usage" n have ncdu; then
+        _pm_install ncdu || warn "ncdu install failed"
     fi
-
-    if confirm "Install GitHub CLI (gh)?" y; then
-        if user_cmd_exists gh; then ok "gh already installed"
-        else spinner "installing GitHub CLI" _install_gh || warn "gh install failed"; fi
+    if want "GitHub CLI (gh)" "" y user_cmd_exists gh; then
+        spinner "installing GitHub CLI" _install_gh || warn "gh install failed"
     fi
-
-    if confirm "Install Claude Code?" y; then
-        if user_cmd_exists claude; then ok "claude code already installed"
-        else
-            info "installing Claude Code (native binary)"
-            if run_user "$TARGET_USER" bash -o pipefail -c 'curl -fsSL https://claude.ai/install.sh | bash'; then
-                ok "claude code installed"
-            else
-                warn "claude code install failed"
-            fi
-        fi
+    if want "Claude Code" "" y user_cmd_exists claude; then
+        info "installing Claude Code (native binary)"
+        user_installer "claude code" 'curl -fsSL https://claude.ai/install.sh | bash'
     fi
-
-    if confirm "Install opencode?" y; then
-        if user_cmd_exists opencode; then ok "opencode already installed"
-        else
-            info "installing opencode"
-            if run_user "$TARGET_USER" bash -o pipefail -c 'curl -fsSL https://opencode.ai/install | bash'; then
-                ok "opencode installed"
-            else
-                warn "opencode install failed"
-            fi
-        fi
+    if want "Codex CLI" "" y user_cmd_exists codex; then
+        if spinner "installing Codex CLI" _install_codex; then ok "codex installed"
+        else warn "codex install failed"; fi
+    fi
+    if want opencode "" y user_cmd_exists opencode; then
+        info "installing opencode"
+        user_installer opencode 'curl -fsSL https://opencode.ai/install | bash'
     fi
 
     # Only write the rc file for the shell actually set as the target's login
@@ -1410,8 +1516,8 @@ step_tools() {
     cur_shell="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
     zsh_cmd="$(command -v zsh 2>/dev/null || true)"
 
-    if [[ $want_zsh -eq 1 && -n "$zsh_cmd" ]] && confirm "Set default shell to zsh and write ~/.zshrc?" y; then
-        if write_rc_file "$TARGET_HOME" ".zshrc" "zshrc"; then
+    if [[ $want_zsh -eq 1 && -n "$zsh_cmd" ]] && confirm "Set default shell to zsh and set up ~/.zshrc?" y; then
+        if install_shell_rc zsh; then
             if [[ "$cur_shell" != "$zsh_cmd" ]]; then
                 if asroot chsh -s "$zsh_cmd" "$TARGET_USER" 2>/dev/null; then
                     ok "default shell -> zsh for $TARGET_USER (new shells only)"
@@ -1420,15 +1526,15 @@ step_tools() {
                 fi
             fi
         else
-            warn "failed to write ~/.zshrc"
+            warn "failed to set up ~/.zshrc"
         fi
     elif [[ "$cur_shell" == */zsh ]]; then
-        if confirm "Write ~/.zshrc (adds zoxide & installed tools to PATH)?" y; then
-            write_rc_file "$TARGET_HOME" ".zshrc" "zshrc" || warn "failed to write ~/.zshrc"
+        if confirm "Set up ~/.zshrc (PATH, completions, aliases for installed tools; keeps your own settings)?" y; then
+            install_shell_rc zsh || warn "failed to set up ~/.zshrc"
         fi
     else
-        if confirm "Write ~/.bashrc (adds zoxide & installed tools to PATH)?" y; then
-            write_rc_file "$TARGET_HOME" ".bashrc" "bashrc" || warn "failed to write ~/.bashrc"
+        if confirm "Set up ~/.bashrc (PATH, completions, aliases for installed tools; keeps your own settings)?" y; then
+            install_shell_rc bash || warn "failed to set up ~/.bashrc"
         fi
     fi
     return 0
@@ -1500,20 +1606,20 @@ _install_lazyvim() {
 
 step_neovim() {
     ensure_user_dirs
-    if confirm "Install latest Neovim?" y; then
-        if command -v nvim >/dev/null 2>&1; then
-            ok "neovim already installed: $(nvim --version 2>/dev/null | head -1)"
-        elif spinner "installing neovim" _install_neovim; then
-            ok "neovim installed: $(nvim --version 2>/dev/null | head -1)"
-        else
-            warn "neovim install failed"
-            return 1
-        fi
-    else
+    if have nvim; then
+        ok "neovim already installed: $(nvim --version 2>/dev/null | head -1)"
+    elif ! confirm "Install latest Neovim?" y; then
         return 0
+    elif spinner "installing neovim" _install_neovim; then
+        ok "neovim installed: $(nvim --version 2>/dev/null | head -1)"
+    else
+        warn "neovim install failed"
+        return 1
     fi
 
-    if confirm "Install LazyVim (Neovim config distribution)?" y; then
+    if grep -qs LazyVim "$TARGET_HOME/.config/nvim/lua/config/lazy.lua"; then
+        ok "LazyVim already installed"
+    elif confirm "Install LazyVim (Neovim config distribution)?" y; then
         if ! _install_lazyvim; then
             warn "LazyVim setup failed; see messages above"
             return 1
@@ -1556,56 +1662,33 @@ _install_dotnet() { # always latest LTS via the official script (no pinned versi
 }
 
 step_toolchains() {
-    if confirm "Install bun (JavaScript runtime)?" n; then
-        if user_cmd_exists bun; then ok "bun already installed"
-        elif run_user "$TARGET_USER" bash -o pipefail -c 'curl -fsSL https://bun.sh/install | bash'; then ok "bun installed"
-        else warn "bun install failed"; fi
+    if want bun "JavaScript runtime" n user_cmd_exists bun; then
+        user_installer bun 'curl -fsSL https://bun.sh/install | bash'
     fi
-
-    if confirm "Install Node.js + npm (Nodesource LTS)?" n; then
-        if user_cmd_exists node; then ok "node already installed"
-        elif spinner "installing nodejs + npm" _install_node; then ok "node installed"
+    if want "Node.js + npm" "Nodesource LTS" n user_cmd_exists node; then
+        if spinner "installing nodejs + npm" _install_node; then ok "node installed"
         else warn "node install failed"; fi
     fi
-
-    if confirm "Install Rust (rustup)?" n; then
-        if user_cmd_exists cargo; then ok "rust already installed"
-        elif run_user "$TARGET_USER" bash -o pipefail -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'; then ok "rust installed"
-        else warn "rustup install failed"; fi
+    if want Rust "rustup" n user_cmd_exists cargo; then
+        user_installer rust 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path'
     fi
-
-    if confirm "Install .NET SDK (latest LTS)?" n; then
-        if user_cmd_exists dotnet; then ok "dotnet already installed"
-        elif spinner "installing dotnet sdk" _install_dotnet; then ok "dotnet sdk installed"
+    if want ".NET SDK" "latest LTS" n user_cmd_exists dotnet; then
+        if spinner "installing dotnet sdk" _install_dotnet; then ok "dotnet sdk installed"
         else warn "dotnet install failed"; fi
     fi
-
-    if confirm "Install meson (build system)?" n; then
-        if command -v meson >/dev/null 2>&1; then ok "meson already installed"
-        else spinner "installing meson" _pm_install meson || warn "meson install failed"; fi
+    if want meson "build system" n have meson; then
+        _pm_install meson || warn "meson install failed"
     fi
-
-    if confirm "Install ninja (build tool)?" n; then
-        if command -v ninja >/dev/null 2>&1; then ok "ninja already installed"
-        else
-            local ninja_pkg="ninja"
-            [[ "$PM" == apt || "$PM" == dnf || "$PM" == yum ]] && ninja_pkg="ninja-build"
-            spinner "installing ninja" _pm_install "$ninja_pkg" || warn "ninja install failed"
-        fi
+    if want ninja "build tool" n have ninja; then
+        local ninja_pkg="ninja"
+        [[ "$PM" == apt || "$PM" == dnf || "$PM" == yum ]] && ninja_pkg="ninja-build"
+        _pm_install "$ninja_pkg" || warn "ninja install failed"
     fi
-
-    if confirm "Install cmake?" n; then
-        if command -v cmake >/dev/null 2>&1; then
-            ok "cmake already installed"
-        else
-            spinner "installing cmake" _pm_install cmake || warn "cmake install failed"
-        fi
+    if want cmake "" n have cmake; then
+        _pm_install cmake || warn "cmake install failed"
     fi
-
-    if confirm "Install uv (Python package manager)?" y; then
-        if user_cmd_exists uv; then ok "uv already installed"
-        elif run_user "$TARGET_USER" bash -o pipefail -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'; then ok "uv installed"
-        else warn "uv install failed"; fi
+    if want uv "Python package manager" y user_cmd_exists uv; then
+        user_installer uv 'curl -LsSf https://astral.sh/uv/install.sh | sh'
     fi
     return 0
 }
@@ -1622,7 +1705,7 @@ _install_vscode() {
             asroot chmod a+r "$keyring" 2>/dev/null || true
             printf 'deb [arch=amd64,arm64,armhf signed-by=%s] https://packages.microsoft.com/repos/code stable main\n' \
                 "$keyring" | asroot tee /etc/apt/sources.list.d/vscode.list >/dev/null || return 1
-            apt_get update -qq || true
+            apt_update
             apt_get install -y code || return 1
             register_managed "code" "distro:apt"
             ;;
@@ -1665,9 +1748,13 @@ _install_vscode_extensions() {
     user_cmd_exists uv     && exts+=(ms-python.python charliermarsh.ruff)
     user_cmd_exists dotnet && exts+=(ms-dotnettools.csharp)
 
-    info "offering ${#exts[@]} extension(s) for $TARGET_USER..."
-    local e failed_n=0
+    local installed e failed_n=0
+    installed="$(run_user "$TARGET_USER" code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]')"
     for e in "${exts[@]}"; do
+        if grep -qxF "${e,,}" <<< "$installed"; then
+            ok "extension already installed: $e"
+            continue
+        fi
         confirm "Install VS Code extension $e?" y || continue
         if run_user "$TARGET_USER" code --install-extension "$e" --force >/dev/null 2>&1; then
             ok "extension: $e"
@@ -1706,7 +1793,9 @@ _gitconfig_content() {
     local name email ghbin GIT_NAME GIT_EMAIL GH_BIN
     read_line "git user.name [${TARGET_USER}]: "; name="${REPLY:-${TARGET_USER}}"
     read_line "git user.email [${TARGET_USER}@$(host_name)]: "; email="${REPLY:-${TARGET_USER}@$(host_name)}"
-    ghbin="$(command -v gh 2>/dev/null || echo /usr/bin/gh)"
+    # A missing absolute path would break every https git operation; a bare
+    # `gh` resolves once the Dev tools step (or the user) installs it.
+    ghbin="$(command -v gh 2>/dev/null || echo gh)"
     # Used by name through subst_template's indirect variable expansion.
     # shellcheck disable=SC2034
     GIT_NAME="$name"
@@ -1964,15 +2053,6 @@ _setup_ssh_signing() {
     email="$(run_user "$TARGET_USER" git config --global user.email 2>/dev/null)"
     email="${email:-${TARGET_USER}@$(host_name)}"
 
-    printf '\n%sCurrent signing config for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
-    if _report_git_signing_status; then
-        ok "git commit signing already fully configured"
-    else
-        info "git commit signing not yet fully configured"
-    fi
-    _report_ssh_key_status || true
-    printf '\n'
-
     asroot install -d -m 700 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER" 2>/dev/null || echo "$TARGET_USER")" "$ssh_dir"
     # Ensure openssh-client (provides ssh-keygen, ssh-copy-id) is available
     if ! command -v ssh-keygen >/dev/null 2>&1; then
@@ -2110,63 +2190,100 @@ _setup_ssh_signing() {
     run_git_config gpg.ssh.allowedSignersFile "$ssh_dir/allowed_signers"
     ok "git commit signing (ssh) configured with $pub"
 
-    # --- GitHub upload: distinguish authentication vs signing keys ---
-    # Authentication keys (push/pull) live at /user/keys, signing keys at /user/ssh_signing_keys.
-    # The old script only uploaded an authentication key, so commits showed "Unverified"
-    # even though push worked. Now we upload both when gh is authenticated.
-    if command -v gh >/dev/null 2>&1 && run_user "$TARGET_USER" bash -c 'gh auth status >/dev/null 2>&1'; then
-        local title
-        title="bootstrap-$(host_name)-$(date +%Y%m%d)"
-        local already_auth=0 already_sign=0
-
-        # Check auth key exists (match by key material to avoid duplicate titles)
-        if run_user "$TARGET_USER" bash -c "gh api user/keys --paginate 2>/dev/null | grep -qF \"$key_material\"" 2>/dev/null; then
-            already_auth=1
-            info "GitHub authentication key already present (skipping upload)"
-        else
-            if run_user "$TARGET_USER" bash -c "gh ssh-key add \"$pub\" --title \"$title-auth\" 2>/dev/null"; then
-                ok "SSH authentication key uploaded to GitHub (for git push/pull)"
-            else
-                # gh ssh-key add may fail if title exists; try with unique title
-                if run_user "$TARGET_USER" bash -c "gh ssh-key add \"$pub\" --title \"$title-auth-\$(date +%s)\" 2>/dev/null"; then
-                    ok "SSH authentication key uploaded to GitHub"
-                else
-                    warn "couldn't upload authentication key to GitHub (may already exist or need 'gh auth refresh -h github.com -s write:public_key')"
-                fi
-            fi
-        fi
-
-        # Check signing key exists
-        if run_user "$TARGET_USER" bash -c "gh api user/ssh_signing_keys --paginate 2>/dev/null | grep -qF \"$key_material\"" 2>/dev/null; then
-            already_sign=1
-            info "GitHub SSH signing key already present (commits will show Verified)"
-        else
-            # need admin:public_key or write:public_key scope; try refresh then upload via api
-            run_user "$TARGET_USER" bash -c "gh auth refresh -h github.com -s write:public_key 2>/dev/null" || true
-            # Use gh api to create ssh_signing_key (gh ssh-key add does NOT create signing keys)
-            if run_user "$TARGET_USER" bash -c "gh api --method POST user/ssh_signing_keys -f title=\"$title-sign\" -f key=\"\$(cat \"$pub\")\" >/dev/null 2>&1"; then
-                ok "SSH signing key uploaded to GitHub (commits will show Verified)"
-            else
-                # Fallback: try with full pubkey line quoted
-                if run_user "$TARGET_USER" bash -c "cat \"$pub\" | xargs -I{} gh api --method POST user/ssh_signing_keys -f title=\"$title-sign-\$(date +%s)\" -f key=\"{}\" >/dev/null 2>&1"; then
-                    ok "SSH signing key uploaded to GitHub (fallback)"
-                else
-                    warn "couldn't upload SSH signing key to GitHub; add manually:"
-                    warn "  gh api --method POST user/ssh_signing_keys -f title=\"$title-sign\" -f key=\"\$(cat $pub)\""
-                    warn "  or add at https://github.com/settings/keys (SSH signing keys -> New SSH signing key)"
-                fi
-            fi
-        fi
-
-        if [[ $already_auth -eq 1 && $already_sign -eq 1 ]]; then
-            ok "GitHub keys already up to date"
-        fi
-    else
-        warn "gh not authenticated yet; add keys manually after 'gh auth login':"
-        warn "  gh ssh-key add $pub --title \"\$(hostname)-auth\""
-        warn "  gh api --method POST user/ssh_signing_keys -f title=\"\$(hostname)-sign\" -f key=\"\$(cat $pub)\""
-    fi
+    _setup_github_keys "$pub" || warn "GitHub key setup incomplete; see messages above"
     return 0
+}
+
+# ----------------------------------------------------------------------------
+#  GitHub: login, key upload (authentication + signing), host keys, verify
+# ----------------------------------------------------------------------------
+GH_KEY_SCOPES="admin:public_key,admin:ssh_signing_key"
+
+_gh() { run_user "$TARGET_USER" gh "$@"; }
+
+_gh_authed() { command -v gh >/dev/null 2>&1 && _gh auth status >/dev/null 2>&1; }
+
+# gh login is interactive (device code / browser); never hide its output.
+_github_login() {
+    command -v gh >/dev/null 2>&1 || { warn "gh is not installed (Dev tools step); can't upload keys to GitHub"; return 1; }
+    _gh_authed && return 0
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        warn "gh is not logged in and -y can't answer its login prompts; run 'gh auth login' later"
+        return 1
+    fi
+    confirm "Log in to GitHub now with gh (needed to upload your keys)?" y || return 1
+    _gh auth login -h github.com -p ssh -w -s "$GH_KEY_SCOPES" && _gh_authed
+}
+
+# Pin GitHub's host keys from its HTTPS API so the first push doesn't stop at
+# an unverified host-key prompt.
+_github_known_hosts() {
+    local kh="$TARGET_HOME/.ssh/known_hosts" keys
+    run_user "$TARGET_USER" ssh-keygen -F github.com -f "$kh" >/dev/null 2>&1 && return 0
+    keys="$(curl -fsSL https://api.github.com/meta 2>/dev/null \
+        | grep -oE '"(ssh-[a-z0-9]+|ecdsa-[a-z0-9-]+) [A-Za-z0-9+/=]+"' | tr -d '"' | sed 's/^/github.com /')"
+    if [[ -z "$keys" ]]; then
+        warn "could not fetch GitHub's SSH host keys; the first push will ask you to confirm the host"
+        return 1
+    fi
+    printf '%s\n' "$keys" | run_user "$TARGET_USER" bash -c 'umask 077; cat >> "$HOME/.ssh/known_hosts"' || return 1
+    ok "added GitHub's SSH host keys to $kh"
+}
+
+_gh_has_key() { # _gh_has_key user/keys|user/ssh_signing_keys MATERIAL
+    _gh api "$1" --paginate 2>/dev/null | grep -qF "$2"
+}
+
+_gh_add_key() { # _gh_add_key auth|signing PUB TITLE
+    if [[ "$1" == auth ]]; then
+        _gh ssh-key add "$2" --title "$3" >/dev/null
+    else
+        # `gh ssh-key add --type signing` needs gh >= 2.30; the API works everywhere.
+        run_user "$TARGET_USER" bash -c 'gh api --method POST user/ssh_signing_keys -f title="$1" -f key="$(cat "$2")" >/dev/null' \
+            _ "$3" "$2"
+    fi
+}
+
+_setup_github_keys() { # _setup_github_keys PUB
+    local pub="$1" material title kind endpoint failed=0 refreshed=0
+    _github_known_hosts || true
+    _github_login || return 1
+    material="$(run_user "$TARGET_USER" cut -d' ' -f2 "$pub" 2>/dev/null)"
+    [[ -n "$material" ]] || { err "could not read $pub"; return 1; }
+    title="$(host_name)"
+
+    for kind in auth signing; do
+        endpoint="user/keys"; [[ $kind == signing ]] && endpoint="user/ssh_signing_keys"
+        if _gh_has_key "$endpoint" "$material"; then
+            ok "GitHub $kind key already uploaded"
+            continue
+        fi
+        if ! _gh_add_key "$kind" "$pub" "$title" 2>/dev/null; then
+            # Usually a missing scope: tokens from a plain `gh auth login` can't
+            # manage keys. Refresh once (interactive) and retry.
+            if [[ $refreshed -eq 0 && $ASSUME_YES -eq 0 ]] \
+                && confirm "gh needs the $GH_KEY_SCOPES scopes to upload keys; grant them now?" y; then
+                refreshed=1
+                _gh auth refresh -h github.com -s "$GH_KEY_SCOPES" || true
+            fi
+            if ! _gh_add_key "$kind" "$pub" "$title"; then
+                warn "could not upload the $kind key; add $pub at https://github.com/settings/keys"
+                failed=1
+                continue
+            fi
+        fi
+        ok "uploaded $kind key to GitHub ($title)"
+    done
+
+    # Prove pushes will work: GitHub answers "Hi <user>! You've successfully authenticated".
+    if run_user "$TARGET_USER" ssh -T -o BatchMode=yes -o ConnectTimeout=10 git@github.com 2>&1 \
+        | grep -q 'successfully authenticated'; then
+        ok "ssh git@github.com works (push/pull over SSH ready)"
+    else
+        warn "ssh git@github.com did not authenticate yet (a new key can take a moment to apply)"
+        failed=1
+    fi
+    return "$failed"
 }
 
 # One-time check that SSH commit signing actually works: create a scratch repo
@@ -2237,10 +2354,6 @@ _validate_git_signing() {
 _setup_passwordless_ssh() {
     local ssh_dir="$TARGET_HOME/.ssh"
     local key pub
-
-    printf '\n%sCurrent SSH key status for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
-    _report_ssh_key_status || true
-    printf '\n'
 
     key="$(_find_existing_ssh_key 2>/dev/null || echo "$ssh_dir/id_ed25519")"
     pub="${key}.pub"
@@ -2330,9 +2443,8 @@ step_configs() {
     if ! confirm "Install dotfiles (git, ghostty, claude code, opencode, codex, tmux)?" y; then return 0; fi
     local home="$TARGET_HOME"
 
-    # Show existing git identity/signing config before asking to overwrite
+    # Show the existing git config before asking to overwrite it
     printf '\n%sExisting git config for %s:%s\n' "$C_BOLD" "$TARGET_USER" "$C_RESET"
-    _report_git_signing_status || true
     if [[ -f "$home/.gitconfig" ]]; then
         info "  ~/.gitconfig file: exists at $home/.gitconfig"
         printf '%s\n' "  ${C_DIM}--- $home/.gitconfig ---${C_RESET}"
@@ -2375,16 +2487,12 @@ step_configs() {
         _write_file "$home/.tmux.conf" _tmux_content
     fi
 
-    # Report current signing state before prompting — so re-running the script
-    # clearly shows if signing is already set up or not.
+    # Report current signing state once before prompting, so re-running the
+    # script clearly shows whether signing is already set up.
     local signing_already=1
-    if _report_git_signing_status >/dev/null 2>&1; then
-        signing_already=0
-    fi
-    # Re-report verbosely for the user before the prompt
-    printf '\n%sSSH commit signing status:%s\n' "$C_BOLD" "$C_RESET"
-    _report_git_signing_status || true
+    printf '\n%sSSH key + commit signing status:%s\n' "$C_BOLD" "$C_RESET"
     _report_ssh_key_status || true
+    _report_git_signing_status && signing_already=0
     printf '\n'
 
     local signing_prompt="Set up SSH key-based commit signing for git & GitHub?"
@@ -2425,8 +2533,8 @@ _ffmpeg_apt_repo() {
     fetch_key "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x4A7F0DDDBEB5A8B4" "$keyring" || return 1
     printf 'deb [signed-by=%s] https://ppa.launchpadcontent.net/ffmpeg/ffmpeg/ubuntu %s main\n' \
         "$keyring" "${CODENAME:-$VERSION_ID}" | asroot tee /etc/apt/sources.list.d/ffmpeg-ffmpeg.list >/dev/null || return 1
-    apt_get update -qq || true
-    apt_get install -y ffmpeg
+    apt_update
+    run_quiet "installing ffmpeg" apt_get install -y ffmpeg
 }
 
 install_ffmpeg() {
@@ -2434,7 +2542,10 @@ install_ffmpeg() {
         ok "ffmpeg already installed: $(ffmpeg -version 2>/dev/null | head -1)"
         return 0
     fi
-    if ! confirm "Install ffmpeg (distro package)?" y; then return 0; fi
+    if ! confirm "Install ffmpeg (distro package; required by the rec screen recorder)?" y; then
+        [[ $SKIP_REC -eq 1 ]] || warn "without ffmpeg, rec (installed later) can't record"
+        return 0
+    fi
 
     case "$PM" in
         apt)
@@ -2490,8 +2601,8 @@ install_edge() {
             fetch_key https://packages.microsoft.com/keys/microsoft.asc "$keyring" || return 1
             printf 'Types: deb\nURIs: https://packages.microsoft.com/repos/edge\nSuites: stable\nComponents: main\nSigned-By: %s\nArchitectures: amd64\n' \
                 "$keyring" | asroot tee /etc/apt/sources.list.d/microsoft-edge.sources >/dev/null || return 1
-            apt_get update -qq || true
-            apt_get install -y microsoft-edge-stable || return 1
+            apt_update
+            run_quiet "installing microsoft edge" apt_get install -y microsoft-edge-stable || return 1
             register_managed "microsoft-edge-stable" "distro:apt"
             ;;
         dnf|yum)
@@ -2606,6 +2717,14 @@ _install_scpt() {
 
 step_scpt() {
     ensure_user_dirs
+    local scpt_present=0
+    if user_cmd_exists scpt || [[ -x "$TARGET_HOME/.local/bin/scpt" ]]; then
+        scpt_present=1
+        ok "scpt already installed at $TARGET_HOME/.local/bin/scpt"
+        confirm "Reinstall/overwrite scpt?" n || return 0
+    elif ! confirm "Install scpt (tmux SSH helper + file transfer)?" y; then
+        return 0
+    fi
     # tmux is required for scpt; install if missing
     if [[ $OFFLINE -eq 1 ]]; then
         command -v tmux >/dev/null 2>&1 || warn "offline: tmux not installed; scpt needs it to run"
@@ -2621,16 +2740,14 @@ step_scpt() {
         info "openssh-client not found (required for scpt), installing..."
         _pm_install openssh-client 2>/dev/null || _pm_install openssh 2>/dev/null || warn "openssh-client install failed"
     fi
-    # optional: nmap for scan feature
-    if ! command -v nmap >/dev/null 2>&1; then
-        info "nmap not found (optional for 'scpt --scan'), skipping auto-install"
+    # optional: nmap powers 'scpt --scan' (finding hosts on the network)
+    if [[ $OFFLINE -eq 1 ]]; then
+        have nmap || info "offline: nmap not installed ('scpt --scan' needs it)"
+    elif want nmap "optional, used by 'scpt --scan' to find hosts" y have nmap; then
+        _pm_install nmap || warn "nmap install failed; 'scpt --scan' won't work"
     fi
-    if ! confirm "Install scpt (tmux SSH helper + file transfer)?" y; then return 0; fi
-    if user_cmd_exists scpt || [[ -x "$TARGET_HOME/.local/bin/scpt" ]]; then
-        ok "scpt already installed at $TARGET_HOME/.local/bin/scpt"
-        if confirm "Reinstall/overwrite scpt?" n; then
-            spinner "installing scpt" _install_scpt || warn "scpt install failed"
-        fi
+    if [[ $scpt_present -eq 1 ]]; then
+        spinner "installing scpt" _install_scpt || warn "scpt install failed"
     else
         if spinner "installing scpt" _install_scpt; then
             ok "scpt installed: $(run_user "$TARGET_USER" scpt --help 2>/dev/null | head -1 || echo 'scpt --help for usage')"
@@ -2720,21 +2837,30 @@ _install_rec() {
 }
 
 step_rec() {
-    if ! confirm "Install rec (ffmpeg screen recorder TUI)?" y; then return 0; fi
-    if ! command -v ffmpeg >/dev/null 2>&1; then
-        warn "ffmpeg not found; rec needs it (see the extras step)"
+    if [[ -x "$TARGET_HOME/.local/share/rec/rec" ]]; then
+        ok "rec already installed"
+        confirm "Update rec to this version?" n || return 0
+    elif ! confirm "Install rec (screen recorder TUI; requires ffmpeg)?" y; then
+        return 0
     fi
-    local pkgs=() pkg
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        warn "rec requires ffmpeg, which is not installed"
+        install_ffmpeg || warn "ffmpeg install failed"
+        command -v ffmpeg >/dev/null 2>&1 || warn "rec will be installed but can't record until ffmpeg is installed"
+    fi
+    local pkgs=() missing=() pkg
     if mapfile -t pkgs < <(_rec_deps); then
-        [[ "$PM" == apt ]] && { apt_get update -qq || true; }
-        for pkg in "${pkgs[@]}"; do
-            spinner "installing $pkg" _pm_install "$pkg" || warn "$pkg install failed (rec may lose that feature)"
-        done
+        for pkg in "${pkgs[@]}"; do pkg_installed "$pkg" || missing+=("$pkg"); done
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            ok "rec dependencies already installed"
+        else
+            [[ "$PM" == apt ]] && apt_update
+            for pkg in "${missing[@]}"; do
+                _pm_install "$pkg" || warn "$pkg install failed (rec may lose that feature)"
+            done
+        fi
     else
         warn "no package list for '$PM'; install xwininfo, python3 tk + gobject, slop, notify-send manually"
-    fi
-    if [[ -x "$TARGET_HOME/.local/share/rec/rec" ]] && ! confirm "rec already installed; update it?" y; then
-        return 0
     fi
     spinner "installing rec" _install_rec || { warn "rec install failed"; return 1; }
     return 0
@@ -2756,10 +2882,11 @@ summary() {
     printf '%s\n' "${C_GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
     printf '\n%sNext steps:%s\n' "${C_BOLD}" "${C_RESET}"
     if [[ -n "$WRITTEN_RC" ]]; then
-        printf '     source ~%s   # reload shell config (zoxide, aliases, PATH)\n' "$WRITTEN_RC"
+        printf '     source ~/%s   # reload shell config (PATH, aliases, completions)\n' "$WRITTEN_RC"
     fi
     printf '     gh auth login           # GitHub CLI\n'
     printf '     claude                  # log in to Claude Code\n'
+    printf '     codex                   # log in to Codex\n'
     printf '     opencode                # log in / configure providers\n'
     printf '     restart opencode        # new opencode config loads on restart\n'
     printf '     log out & back in       # pick up docker/sudo group changes\n'
@@ -2793,10 +2920,11 @@ Setup options:
   --skip-toolchains      skip language toolchains step
   --skip-vscode          skip VS Code + extensions step
   --skip-configs         skip dotfiles step
-  --skip-extras          skip extra apps (ffmpeg, microsoft edge)
+  --skip-extras          skip extra apps (ffmpeg - required by rec, microsoft edge)
   --skip-scpt            skip scpt (tmux SSH helper + file transfer) step
-  --skip-rec             skip rec (ffmpeg screen recorder TUI) step
+  --skip-rec             skip rec (screen recorder TUI, requires ffmpeg) step
   --tui-off              plain output, no colors/spinners
+  -v, --verbose          show package-manager output (by default only on failure)
 
 Manage commands:
   manage                 interactive TUI: pick installed tools to remove
@@ -2845,6 +2973,7 @@ parse_args() {
             --skip-sft) SKIP_SCPT=1 ;; # backward compat: sft now part of scpt
             --skip-rec) SKIP_REC=1 ;;
             --tui-off) TUI_OFF=1 ;;
+            -v|--verbose) VERBOSE=1 ;;
             -h|--help) usage; exit 0 ;;
             *) err "unknown option: $1"; usage; return 1 ;;
         esac
@@ -3132,9 +3261,9 @@ main() {
     maybe_step "$SKIP_TOOLCHAINS" net "Language toolchains" step_toolchains
     maybe_step "$SKIP_VSCODE" net "VS Code + extensions" step_vscode
     maybe_step "$SKIP_CONFIGS" local "Dotfiles / configs" step_configs
-    maybe_step "$SKIP_EXTRAS" net "Extra apps (ffmpeg, edge)" step_extras
+    maybe_step "$SKIP_EXTRAS" net "Extra apps (ffmpeg for rec, edge)" step_extras
     maybe_step "$SKIP_SCPT" local "scpt (tmux SSH helper + file transfer)" step_scpt
-    maybe_step "$SKIP_REC" net "rec (screen recorder)" step_rec
+    maybe_step "$SKIP_REC" net "rec (screen recorder, needs ffmpeg)" step_rec
 
     ensure_home_ownership
     summary

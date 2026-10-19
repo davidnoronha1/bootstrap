@@ -135,6 +135,144 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn('could not download signing key', proc.stderr)
         self.assertNotIn('GPG-CALLED', proc.stdout)
 
+    def test_scpt_asks_before_installing_dependencies(self):
+        proc = self.bash('''
+            TARGET_USER="$(id -un)"; TARGET_HOME="$HOME"
+            command() { [[ "$1 $2" == "-v tmux" ]] && return 1; builtin command "$@"; }
+            _pm_install() { echo "INSTALL:$*"; }
+            confirm() { echo "ASK:$1"; return 1; }
+            step_scpt
+        ''')
+        self.assert_ok(proc)
+        self.assertIn('ASK:Install scpt', proc.stdout)
+        self.assertNotIn('INSTALL:', proc.stdout)
+
+    def test_gitconfig_template_has_no_signing_paths(self):
+        text = (SCRIPT.parent / 'files/gitconfig').read_text()
+        for key in ('signingkey', 'gpgsign', 'allowedSignersFile'):
+            self.assertNotIn(key, text)
+
+    def test_github_keys_uploads_missing_keys_and_verifies(self):
+        pub = self.home / 'id.pub'
+        pub.write_text('ssh-ed25519 AAAAMATERIAL me@host\n')
+        proc = self.bash('''
+            TARGET_USER="$(id -un)"; TARGET_HOME="$HOME"
+            _github_known_hosts() { :; }
+            _github_login() { :; }
+            _gh_has_key() { [[ "$1" == user/keys ]]; }
+            _gh_add_key() { echo "ADD:$1"; }
+            run_user() { shift; if [[ "$1" == ssh ]]; then echo "Hi me! You've successfully authenticated"; else "$@"; fi; }
+            _setup_github_keys "$1"
+        ''', str(pub))
+        self.assert_ok(proc)
+        self.assertIn('auth key already uploaded', proc.stdout)
+        self.assertIn('ADD:signing', proc.stdout)
+        self.assertNotIn('ADD:auth', proc.stdout)
+        self.assertIn('push/pull over SSH ready', proc.stdout)
+
+    def test_install_prompts_skip_tools_that_are_present(self):
+        proc = self.bash('''
+            confirm() { echo "ASK:$1"; return 0; }
+            want bash "" y have bash && echo INSTALL-bash
+            want nope-tool "desc" y have nope-tool-xyz && echo INSTALL-nope
+        ''')
+        self.assert_ok(proc)
+        self.assertIn('bash already installed', proc.stdout)
+        self.assertNotIn('ASK:Install bash', proc.stdout)
+        self.assertNotIn('INSTALL-bash', proc.stdout)
+        self.assertIn('ASK:Install nope-tool (desc)?', proc.stdout)
+        self.assertIn('INSTALL-nope', proc.stdout)
+
+    def test_tools_step_never_asks_about_installed_tools(self):
+        proc = self.bash('''
+            TARGET_USER="$(id -un)"; TARGET_HOME="$HOME"
+            have() { return 0; }
+            user_cmd_exists() { return 0; }
+            confirm() { echo "ASK:$1"; return 1; }
+            step_tools
+        ''')
+        self.assert_ok(proc)
+        asks = [l for l in proc.stdout.splitlines() if l.startswith('ASK:Install')]
+        self.assertEqual(asks, [])
+
+    def rc_env(self):
+        return '''
+            init_tmp || exit 1
+            trap cleanup_tmp EXIT
+            FILES_DIR="$PWD/files"
+            TARGET_USER="$(id -un)"; TARGET_HOME="$HOME"
+            asroot() { command "$@"; }
+        '''
+
+    def test_bashrc_keeps_user_content_and_is_idempotent(self):
+        (self.files / 'bashrc').write_text('# managed\n')
+        rc = self.home / '.bashrc'
+        rc.write_text('# my stuff\nexport FOO=1\n')
+        proc = self.bash(self.rc_env() + 'install_shell_rc bash && install_shell_rc bash')
+        self.assert_ok(proc)
+        text = rc.read_text()
+        self.assertTrue(text.startswith('# my stuff\nexport FOO=1\n'))
+        self.assertEqual(text.count('# >>> bootstrap.sh >>>'), 1)
+        self.assertEqual(text, '# my stuff\nexport FOO=1\n\n# >>> bootstrap.sh >>>\n'
+                         '[ -f "$HOME/.config/bootstrap/bashrc" ] && . "$HOME/.config/bootstrap/bashrc"\n'
+                         '# <<< bootstrap.sh <<<\n')
+        self.assertEqual((self.home / '.config/bootstrap/bashrc').read_text(), '# managed\n')
+        self.assertTrue((self.home / '.bash_profile').exists())
+
+    def test_bashrc_recovers_original_from_old_full_replacement(self):
+        (self.files / 'bashrc').write_text('# managed\n')
+        (self.home / '.bashrc').write_text('# ~/.bashrc - managed by bootstrap.sh (old)\nalias x=y\n')
+        (self.home / '.bashrc.bak').write_text('# original\n')
+        proc = self.bash(self.rc_env() + 'install_shell_rc bash')
+        self.assert_ok(proc)
+        text = (self.home / '.bashrc').read_text()
+        self.assertTrue(text.startswith('# original\n'))
+        self.assertNotIn('alias x=y', text)
+
+    def test_managed_bashrc_handles_present_and_missing_tools(self):
+        bindir = self.root / 'fakebin'
+        bindir.mkdir()
+        for tool in ('eza', 'zoxide'):
+            f = bindir / tool
+            f.write_text('#!/bin/sh\n[ "$1" = init ] && echo "zinit_loaded=1"\n')
+            f.chmod(0o755)
+        (self.home / '.cargo/bin').mkdir(parents=True)
+        rc = SCRIPT.parent / 'files/bashrc'
+        proc = subprocess.run(
+            ['bash', '-ic', f'source {rc}; source {rc}; alias ls; type -t dc || echo no-dc; '
+             'echo "Z=$zinit_loaded"; echo "$PATH"'],
+            env=dict(self.env, PATH=f'{bindir}:/usr/bin:/bin'), text=True, capture_output=True)
+        self.assertIn("eza --group-directories-first", proc.stdout)
+        self.assertIn('Z=1', proc.stdout)
+        path = proc.stdout.strip().splitlines()[-1].split(':')
+        self.assertEqual(path.count(str(self.home / '.cargo/bin')), 1)
+        self.assertNotIn(str(self.home / '.bun/bin'), path)
+
+    def test_pm_install_skips_installed_packages_and_does_not_manage_them(self):
+        proc = self.bash('''
+            PM=apt
+            pkg_installed() { [[ "$1" == have-it ]]; }
+            run_quiet() { shift; "$@"; }
+            _pm_install_now() { echo "PM:$*"; }
+            _pm_install have-it && echo none-run
+            _pm_install have-it need-it
+        ''')
+        self.assert_ok(proc)
+        self.assertIn('none-run', proc.stdout)
+        self.assertIn('PM:need-it', proc.stdout)
+        self.assertNotIn('PM:have-it', proc.stdout)
+
+    def test_quiet_hides_output_on_success_and_shows_it_on_failure(self):
+        proc = self.bash('''
+            init_tmp || exit 1
+            trap cleanup_tmp EXIT
+            quiet sh -c 'echo NOISY-OK'
+            quiet sh -c 'echo NOISY-FAIL; exit 3'; echo "rc=$?"
+        ''')
+        self.assertNotIn('NOISY-OK', proc.stdout + proc.stderr)
+        self.assertIn('NOISY-FAIL', proc.stderr)
+        self.assertIn('rc=3', proc.stdout)
+
     def test_write_failure_does_not_report_success(self):
         proc = self.bash('''
             init_tmp || exit 1

@@ -1,24 +1,43 @@
-# ~/.zshrc - managed by bootstrap.sh (previous copy saved as ~/.zshrc.bak)
-if command -v nvim >/dev/null 2>&1; then
-    export EDITOR=nvim
-    export VISUAL=nvim
-else
-    export EDITOR=vim
-    export VISUAL=vim
+# ~/.config/bootstrap/zshrc - managed by bootstrap.sh, sourced from ~/.zshrc.
+# Re-running bootstrap.sh overwrites this file; put personal changes in ~/.zshrc.
+# Every tool below is set up only if it is installed, so this is safe on any
+# machine and picks up tools installed later without being regenerated.
+
+_bs_have() { command -v "$1" >/dev/null 2>&1; }
+
+# PATH: user-level install locations (only existing dirs, no duplicates)
+typeset -U path
+# (includes tools installed before bootstrap.sh by other means)
+path=("$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/.bun/bin" "$HOME/.opencode/bin"
+      "$HOME/.deno/bin" "$HOME/.volta/bin" "$HOME/.local/share/pnpm" "$HOME/.yarn/bin"
+      "$HOME/.npm-global/bin" "$HOME/.dotnet" "$HOME/.dotnet/tools" "$HOME/go/bin"
+      /usr/local/go/bin /snap/bin $path)
+path=(${^path}(N-/))
+export PATH
+[ -d "$HOME/.bun" ] && export BUN_INSTALL="$HOME/.bun"
+[ -x "$HOME/.dotnet/dotnet" ] && export DOTNET_ROOT="$HOME/.dotnet"
+
+# Homebrew on Linux, pnpm, pyenv: set up only if present
+[ -x /home/linuxbrew/.linuxbrew/bin/brew ] && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+[ -d "$HOME/.local/share/pnpm" ] && export PNPM_HOME="$HOME/.local/share/pnpm"
+if [ -d "$HOME/.pyenv" ]; then
+    export PYENV_ROOT="$HOME/.pyenv"
+    path=("$PYENV_ROOT/bin"(N-/) $path)
+    _bs_have pyenv && eval "$(pyenv init - zsh)"
 fi
 
-# PATH
-export PATH="$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.dotnet:/snap/bin:$PATH"
+# nvm (node), when installed per-user
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
-# bun (matches the tool-managed install location)
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
+# editor: best one available
+for _bs_ed in nvim vim vi nano; do
+    if _bs_have "$_bs_ed"; then export EDITOR="$_bs_ed" VISUAL="$_bs_ed"; break; fi
+done
+unset _bs_ed
 
-# uv env (created by the uv installer when present)
-[ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
-
-# cargo (rust) env
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+# Everything below only matters for interactive shells.
+[[ -o interactive ]] || return 0
 
 # history
 HISTFILE="$HOME/.zsh_history"
@@ -26,46 +45,74 @@ HISTSIZE=10000
 SAVEHIST=10000
 setopt HIST_IGNORE_DUPS SHARE_HISTORY AUTO_CD
 
-# aliases
-alias ls='ls --color=auto'
-alias ll='ls -alF'
-alias la='ls -A'
-alias l='ls -CF'
-alias gdb='gdb -q '
-alias mv='mv -v'
-alias cp='cp -v'
-alias grep='grep --color=auto'
-alias diff='diff --color=auto'
-alias wget='wget --hsts-file /dev/null -c'
-alias killall='pkill'
-alias g='git'
-alias ga='git add'
-alias gc='git commit -m'
-alias gs='git status'
-alias gp='git push'
-alias gl='git log --oneline --graph --decorate --all -20'
-alias gitFixup='git commit --fixup=HEAD'
-alias gitShallowClone='git clone --depth 1'
-alias gitS='git status --short'
-alias dc='docker compose'
-alias dcu='docker compose up -d'
-alias dcd='docker compose down'
-command -v nvim >/dev/null 2>&1 && alias vim='nvim'
-if command -v bat >/dev/null 2>&1; then
-    alias cat='bat'
-elif command -v batcat >/dev/null 2>&1; then
-    alias cat='batcat'
+# completion system (needed by the generated completions below)
+autoload -Uz compinit && compinit -u
+
+# zoxide (z / zi)
+_bs_have zoxide && eval "$(zoxide init zsh)"
+
+# fzf: built-in integration (fzf >= 0.48), else the files distros ship
+if _bs_have fzf; then
+    if ! eval "$(fzf --zsh 2>/dev/null)" 2>/dev/null || ! (( $+functions[fzf-file-widget] )); then
+        for _bs_f in /usr/share/doc/fzf/examples/key-bindings.zsh /usr/share/fzf/key-bindings.zsh \
+            /usr/share/fzf/shell/key-bindings.zsh "$HOME/.fzf.zsh"; do
+            [ -f "$_bs_f" ] && { . "$_bs_f"; break; }
+        done
+        unset _bs_f
+    fi
+    if _bs_have fd; then
+        export FZF_DEFAULT_COMMAND='fd --type f --hidden --exclude .git'
+    elif _bs_have fdfind; then
+        export FZF_DEFAULT_COMMAND='fdfind --type f --hidden --exclude .git'
+    fi
+    [ -n "${FZF_DEFAULT_COMMAND:-}" ] && export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 fi
 
-# nvm (loaded only when installed)
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-[ -s "$NVM_DIR/bash_completion" ] && . "$NVM_DIR/bash_completion"
+# completions for CLIs that generate their own
+_bs_have gh && eval "$(gh completion -s zsh 2>/dev/null)"
+_bs_have uv && eval "$(uv generate-shell-completion zsh 2>/dev/null)"
 
-# zoxide (z) - loaded only when installed
-command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init zsh)"
-
-# fzf completion/keybindings (when installed via the git method)
-command -v fzf >/dev/null 2>&1 && {
-    [ -f "$HOME/.fzf.zsh" ] && . "$HOME/.fzf.zsh"
-}
+# aliases
+if _bs_have eza; then
+    alias ls='eza --group-directories-first'
+    alias ll='eza -alF --group-directories-first --git'
+    alias la='eza -a --group-directories-first'
+    alias l='eza -F'
+else
+    alias ls='ls --color=auto'
+    alias ll='ls -alF'
+    alias la='ls -A'
+    alias l='ls -CF'
+fi
+alias grep='grep --color=auto'
+alias diff='diff --color=auto'
+alias mv='mv -v'
+alias cp='cp -v'
+alias killall='pkill'
+_bs_have gdb && alias gdb='gdb -q '
+_bs_have wget && alias wget='wget --hsts-file /dev/null -c'
+# Debian/Ubuntu install these under other names
+! _bs_have fd && _bs_have fdfind && alias fd='fdfind'
+if _bs_have bat; then
+    alias cat='bat'
+elif _bs_have batcat; then
+    alias bat='batcat'
+    alias cat='batcat'
+fi
+_bs_have nvim && alias vim='nvim'
+if _bs_have git; then
+    alias g='git'
+    alias ga='git add'
+    alias gc='git commit -m'
+    alias gs='git status'
+    alias gp='git push'
+    alias gl='git log --oneline --graph --decorate --all -20'
+    alias gitFixup='git commit --fixup=HEAD'
+    alias gitShallowClone='git clone --depth 1'
+    alias gitS='git status --short'
+fi
+if _bs_have docker; then
+    alias dc='docker compose'
+    alias dcu='docker compose up -d'
+    alias dcd='docker compose down'
+fi
